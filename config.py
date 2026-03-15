@@ -1,61 +1,75 @@
+# config.py
 """
-Configuration du bot Baccarat AI - Version sans cycles
+Configuration BACCARAT AI 🤖
 """
 
 import os
 
-# ============================================================================
-# TELEGRAM API CREDENTIALS
-# ============================================================================
-
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-# ============================================================================
-# ADMIN ET CANAUX
-# ============================================================================
-
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-SOURCE_CHANNEL_ID = -1002682552255
-PREDICTION_CHANNEL_ID = -1003501017916
+def parse_channel_id(env_var: str, default: str) -> int:
+    """Parse l'ID de canal Telegram."""
+    value = os.getenv(env_var) or default
+    try:
+        channel_id = int(value)
+        if channel_id > 0 and len(str(channel_id)) >= 10:
+            channel_id = -channel_id
+        return channel_id
+    except:
+        return int(default)
 
 # ============================================================================
-# PARAMÈTRES DU SERVEUR WEB
+# AUTHENTIFICATION TELEGRAM (VOS IDENTIFIANTS)
 # ============================================================================
 
-PORT = int(os.environ.get("PORT", 8000))
+API_ID = 29177661
+API_HASH = 'a8639172fa8d35dbfd8ea46286d349ab'
+BOT_TOKEN = '8678647348:AAEJ10XquGFuSqViWiQFfXvK-iJHYPfbM2o'
+ADMIN_ID = 1190237801
+
+# Session string (optionnel si BOT_TOKEN utilisé)
+TELEGRAM_SESSION = os.getenv('TELEGRAM_SESSION', '')
 
 # ============================================================================
-# CONFIGURATION COSTUMES
+# CANAUX TELEGRAM (À CONFIGURER SELON VOS BESOINS)
 # ============================================================================
+
+# Canal source où arrivent les résultats de jeux
+SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
+
+# Canal où envoyer les prédictions
+PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003336559159')
+
+# ============================================================================
+# SERVEUR WEB (RENDER.COM)
+# ============================================================================
+
+PORT = int(os.getenv('PORT') or '10000')
+
+# ============================================================================
+# PARAMÈTRES SYSTÈME PRÉDICTION
+# ============================================================================
+
+# Nombre d'échecs consécutifs avant prédiction (seuil B)
+CONSECUTIVE_FAILURES_NEEDED = int(os.getenv('FAILURES_NEEDED', '2'))
+
+# Nombre de numéros vérifiés par tour
+NUMBERS_PER_TOUR = 3
+
+# ============================================================================
+# CYCLES DES COULEURS (SYSTÈME AVANCÉ)
+# ============================================================================
+
+SUIT_CYCLES = {
+    '♠': {'start': 1, 'interval': 5},   # Pique: 1, 6, 11, 16...
+    '♥': {'start': 1, 'interval': 6},   # Cœur: 1, 7, 13, 19...
+    '♦': {'start': 1, 'interval': 6},   # Carreau: 1, 7, 13, 19...
+    '♣': {'start': 1, 'interval': 7},   # Trèfle: 1, 8, 15, 22...
+}
 
 ALL_SUITS = ['♠', '♥', '♦', '♣']
 
 SUIT_DISPLAY = {
-    '♠': '♠️ Pique',
-    '♥': '❤️ Cœur',
-    '♦': '♦️ Carreau',
-    '♣': '♣️ Trèfle'
+    '♠': '♠️',
+    '♥': '❤️',
+    '♦': '♦️',
+    '♣': '♣️'
 }
-
-# ============================================================================
-# PARAMÈTRES COMPTEUR2
-# ============================================================================
-
-COMPTEUR2_SEUIL_B_DEFAULT = 2
-COMPTEUR2_ACTIVE_DEFAULT = True
-
-# ============================================================================
-# PARAMÈTRES DE SÉCURITÉ
-# ============================================================================
-
-FORCE_RESTART_THRESHOLD = 20
-RESET_AT_GAME_NUMBER = 1440
-PREDICTION_TIMEOUT_MINUTES = 30
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-LOG_LEVEL = "INFO"
