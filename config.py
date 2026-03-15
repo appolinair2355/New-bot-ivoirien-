@@ -16,55 +16,25 @@ def parse_channel_id(env_var: str, default: str) -> int:
     except:
         return int(default)
 
-# ============================================================================
-# AUTHENTIFICATION TELEGRAM (VOS IDENTIFIANTS)
-# ============================================================================
-
-API_ID = 29177661
-API_HASH = 'a8639172fa8d35dbfd8ea46286d349ab'
-BOT_TOKEN = '8678647348:AAEJ10XquGFuSqViWiQFfXvK-iJHYPfbM2o'
-ADMIN_ID = 1190237801
-
-# Session string (optionnel si BOT_TOKEN utilisé)
-TELEGRAM_SESSION = os.getenv('TELEGRAM_SESSION', '')
-
-# ============================================================================
-# CANAUX TELEGRAM (À CONFIGURER SELON VOS BESOINS)
-# ============================================================================
-
-# Canal source où arrivent les résultats de jeux
+# Canaux Telegram
 SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
-
-# Canal où envoyer les prédictions
 PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003336559159')
 
-# ============================================================================
-# SERVEUR WEB (RENDER.COM)
-# ============================================================================
+# Authentification
+ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
+API_ID = int(os.getenv('API_ID') or '0')
+API_HASH = os.getenv('API_HASH') or ''
+BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
+TELEGRAM_SESSION = os.getenv('TELEGRAM_SESSION', '')
 
+# Serveur
 PORT = int(os.getenv('PORT') or '10000')
 
-# ============================================================================
-# PARAMÈTRES SYSTÈME PRÉDICTION
-# ============================================================================
+# Compteur2 - compteur d'absences consécutives
+COMPTEUR2_ACTIVE = os.getenv('COMPTEUR2_ACTIVE', 'true').lower() == 'true'
+COMPTEUR2_B = int(os.getenv('COMPTEUR2_B') or '4')
 
-# Nombre d'échecs consécutifs avant prédiction (seuil B)
-CONSECUTIVE_FAILURES_NEEDED = int(os.getenv('FAILURES_NEEDED', '2'))
-
-# Nombre de numéros vérifiés par tour
-NUMBERS_PER_TOUR = 3
-
-# ============================================================================
-# CYCLES DES COULEURS (SYSTÈME AVANCÉ)
-# ============================================================================
-
-SUIT_CYCLES = {
-    '♠': {'start': 1, 'interval': 5},   # Pique: 1, 6, 11, 16...
-    '♥': {'start': 1, 'interval': 6},   # Cœur: 1, 7, 13, 19...
-    '♦': {'start': 1, 'interval': 6},   # Carreau: 1, 7, 13, 19...
-    '♣': {'start': 1, 'interval': 7},   # Trèfle: 1, 8, 15, 22...
-}
-
+# Couleurs
 ALL_SUITS = ['♠', '♥', '♦', '♣']
 
 SUIT_DISPLAY = {
@@ -72,4 +42,12 @@ SUIT_DISPLAY = {
     '♥': '❤️',
     '♦': '♦️',
     '♣': '♣️'
+}
+
+# Inverse des couleurs (pour les prédictions Compteur2)
+SUIT_INVERSE = {
+    '♠': '♦',
+    '♦': '♠',
+    '♥': '♣',
+    '♣': '♥',
 }
