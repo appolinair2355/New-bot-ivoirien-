@@ -51,6 +51,10 @@ compteur2_active = COMPTEUR2_ACTIVE
 compteur2_b = COMPTEUR2_B
 compteur2_absences: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 compteur2_last_game = 0
+# Dernier numéro de jeu vu (présent ou absent) pour chaque costume
+compteur2_last_seen: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
+# Jeux déjà traités par compteur2 (évite double traitement new+edit)
+compteur2_processed_games: set = set()
 
 # Mode Attente - attend PERDU avant de prédire à nouveau
 attente_mode = False
@@ -90,11 +94,6 @@ async def resolve_channel(entity_id):
 # ============================================================================
 
 def is_message_finalized(message: str) -> bool:
-    if '⏰' in message or '⏳' in message:
-        return False
-    lower_msg = message.lower()
-    if any(w in lower_msg for w in ['en cours', 'attente', 'pending', 'wait', 'waiting']):
-        return False
     return '✅' in message or '🔰' in message
 
 def extract_parentheses_groups(message: str) -> List[str]:
@@ -324,26 +323,59 @@ def get_compteur2_status_text() -> str:
     return "\n".join(lines)
 
 async def process_compteur2(game_number: int, suits_in_game: List[str]):
-    """Traite le Compteur2 pour un jeu reçu."""
-    global compteur2_absences, compteur2_last_game
+    """Traite le Compteur2 pour un jeu reçu.
+
+    Compte uniquement les absences CONSÉCUTIVES (numéros de jeu qui se suivent)
+    dans le premier groupe de parenthèses.
+    Un jeu non-consécutif (numéro qui saute) remet le compteur d'absence à 1.
+    Un jeu déjà traité est ignoré pour éviter le double-comptage (new + edit).
+    """
+    global compteur2_absences, compteur2_last_game, compteur2_last_seen, compteur2_processed_games
 
     if not compteur2_active:
         return
 
+    # Ignorer les jeux déjà traités (évite le double-comptage new+edit)
+    if game_number in compteur2_processed_games:
+        logger.info(f"📊 Compteur2 #{game_number}: déjà traité, ignoré")
+        return
+
+    compteur2_processed_games.add(game_number)
+    # Garder uniquement les 200 derniers jeux pour ne pas saturer la mémoire
+    if len(compteur2_processed_games) > 200:
+        oldest = min(compteur2_processed_games)
+        compteur2_processed_games.discard(oldest)
+
     compteur2_last_game = game_number
 
     for suit in ALL_SUITS:
+        last_seen = compteur2_last_seen.get(suit, 0)
+
         if suit in suits_in_game:
+            # Costume présent → réinitialiser le compteur d'absence
             if compteur2_absences[suit] > 0:
-                logger.info(f"📊 Compteur2 {suit}: reset (trouvé au jeu #{game_number})")
+                logger.info(f"📊 Compteur2 {suit}: trouvé au jeu #{game_number} → reset (était {compteur2_absences[suit]})")
             compteur2_absences[suit] = 0
+            compteur2_last_seen[suit] = game_number
         else:
-            compteur2_absences[suit] += 1
+            # Costume absent — vérifier la consécutivité des numéros de jeu
+            if last_seen == 0 or game_number == last_seen + 1:
+                # Consécutif (ou premier jeu vu) → incrémenter
+                compteur2_absences[suit] += 1
+            else:
+                # Non-consécutif : le numéro a sauté → repartir à 1
+                logger.info(
+                    f"📊 Compteur2 {suit}: jeu #{game_number} non-consécutif "
+                    f"(précédent #{last_seen}) → compteur remis à 1"
+                )
+                compteur2_absences[suit] = 1
+
+            compteur2_last_seen[suit] = game_number
             count = compteur2_absences[suit]
-            logger.info(f"📊 Compteur2 {suit}: absence {count}/{compteur2_b} au jeu #{game_number}")
+            logger.info(f"📊 Compteur2 {suit}: absence consécutive {count}/{compteur2_b} (jeu #{game_number})")
 
             if count >= compteur2_b:
-                # Calculer l'inverse
+                # Seuil B atteint → prédire l'inverse
                 inverse_suit = SUIT_INVERSE.get(suit, suit)
                 pred_game = game_number + 1
 
@@ -357,7 +389,7 @@ async def process_compteur2(game_number: int, suits_in_game: List[str]):
                     continue
 
                 logger.info(
-                    f"🔮 Compteur2: {suit} absent {compteur2_b}x → prédiction inverse "
+                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS → prédiction inverse "
                     f"{inverse_suit} pour #{pred_game}"
                 )
                 await send_prediction(pred_game, inverse_suit, suit)
@@ -453,11 +485,14 @@ async def auto_reset_system():
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
     global compteur2_absences, compteur2_last_game, attente_locked
+    global compteur2_last_seen, compteur2_processed_games
 
     stats = len(pending_predictions)
     pending_predictions.clear()
     last_prediction_time = None
     compteur2_absences = {suit: 0 for suit in ALL_SUITS}
+    compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
+    compteur2_processed_games = set()
     compteur2_last_game = 0
     attente_locked = False
 
@@ -483,6 +518,7 @@ async def perform_full_reset(reason: str):
 async def cmd_compteur2(event):
     """Gère le Compteur2 - /compteur2 [on/off/b <val>/reset/status]."""
     global compteur2_active, compteur2_b, compteur2_absences, compteur2_last_game
+    global compteur2_last_seen, compteur2_processed_games
 
     if event.is_group or event.is_channel:
         return
@@ -501,6 +537,8 @@ async def cmd_compteur2(event):
     if arg == 'on':
         compteur2_active = True
         compteur2_absences = {suit: 0 for suit in ALL_SUITS}
+        compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
+        compteur2_processed_games = set()
         await event.respond(
             f"✅ Compteur2 ACTIVÉ | B={compteur2_b}\n\n" + get_compteur2_status_text()
         )
@@ -513,6 +551,8 @@ async def cmd_compteur2(event):
 
     elif arg == 'reset':
         compteur2_absences = {suit: 0 for suit in ALL_SUITS}
+        compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
+        compteur2_processed_games = set()
         compteur2_last_game = 0
         await event.respond("🔄 Compteur2 remis à zéro\n\n" + get_compteur2_status_text())
         logger.info("Admin reset Compteur2")
@@ -529,6 +569,8 @@ async def cmd_compteur2(event):
             old_b = compteur2_b
             compteur2_b = val
             compteur2_absences = {suit: 0 for suit in ALL_SUITS}
+            compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
+            compteur2_processed_games = set()
             await event.respond(
                 f"✅ Compteur2 B: {old_b} → {compteur2_b} | Compteurs remis à zéro\n\n"
                 + get_compteur2_status_text()
