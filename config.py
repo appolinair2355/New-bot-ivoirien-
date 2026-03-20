@@ -16,8 +16,7 @@ def parse_channel_id(env_var: str, default: str) -> int:
     except:
         return int(default)
 
-# Canaux Telegram
-SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
+# Canal de prédiction uniquement
 PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003336559159')
 
 # Authentification
@@ -28,13 +27,16 @@ BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
 TELEGRAM_SESSION = os.getenv('TELEGRAM_SESSION', '')
 
 # Serveur
-PORT = int(os.getenv('PORT') or '10000')
+PORT = int(os.getenv('PORT') or '5000')
+
+# Polling API (secondes entre chaque appel)
+API_POLL_INTERVAL = int(os.getenv('API_POLL_INTERVAL') or '5')
 
 # Compteur2 - compteur d'absences consécutives
 COMPTEUR2_ACTIVE = os.getenv('COMPTEUR2_ACTIVE', 'true').lower() == 'true'
 COMPTEUR2_B = int(os.getenv('COMPTEUR2_B') or '4')
 
-# Couleurs
+# Couleurs (costumes du joueur)
 ALL_SUITS = ['♠', '♥', '♦', '♣']
 
 SUIT_DISPLAY = {

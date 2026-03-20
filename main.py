@@ -1,10 +1,9 @@
 import os
 import asyncio
-import re
 import logging
 import sys
 from typing import List, Optional, Dict
-from datetime import datetime, timedelta
+from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
@@ -12,10 +11,11 @@ from aiohttp import web
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
-    SOURCE_CHANNEL_ID, PREDICTION_CHANNEL_ID, PORT,
+    PREDICTION_CHANNEL_ID, PORT, API_POLL_INTERVAL,
     ALL_SUITS, SUIT_DISPLAY, SUIT_INVERSE,
     COMPTEUR2_ACTIVE, COMPTEUR2_B
 )
+from utils import get_latest_results
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,23 +46,49 @@ last_prediction_time: Optional[datetime] = None
 # Prédictions en attente de vérification {game_number: {...}}
 pending_predictions: Dict[int, dict] = {}
 
-# Compteur2 - absences consécutives par couleur
+# Compteur2 - absences consécutives par couleur (costumes du joueur)
 compteur2_active = COMPTEUR2_ACTIVE
 compteur2_b = COMPTEUR2_B
 compteur2_absences: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 compteur2_last_game = 0
-# Dernier numéro de jeu vu (présent ou absent) pour chaque costume
 compteur2_last_seen: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
-# Jeux déjà traités par compteur2 (évite double traitement new+edit)
 compteur2_processed_games: set = set()
 
 # Mode Attente - attend PERDU avant de prédire à nouveau
 attente_mode = False
-attente_locked = False   # True après une prédiction, attend PERDU pour déverrouiller
+attente_locked = False
 
 # Historique des prédictions
 prediction_history: List[Dict] = []
 MAX_HISTORY_SIZE = 100
+
+# Jeux pour lesquels la main du joueur a déjà été traitée (compteur2)
+player_processed_games: set = set()
+
+# Cache des derniers résultats API {game_number: result_dict}
+api_results_cache: Dict[int, dict] = {}
+
+# ============================================================================
+# UTILITAIRES - Costumes
+# ============================================================================
+
+def normalize_suit(suit_emoji: str) -> str:
+    """Convertit un costume emoji (♠️) en costume simple (♠)."""
+    return suit_emoji.replace('\ufe0f', '').replace('❤', '♥')
+
+def player_suits_from_cards(player_cards: list) -> List[str]:
+    """Extrait la liste des costumes uniques des cartes du joueur."""
+    suits = set()
+    for card in player_cards:
+        raw = card.get('S', '')
+        normalized = normalize_suit(raw)
+        if normalized in ALL_SUITS:
+            suits.add(normalized)
+    return list(suits)
+
+def has_player_cards(result: dict) -> bool:
+    """Retourne True si le joueur a au moins 2 cartes (main prête)."""
+    return len(result.get('player_cards', [])) >= 2
 
 # ============================================================================
 # UTILITAIRES - Canaux
@@ -88,28 +114,6 @@ async def resolve_channel(entity_id):
     except Exception as e:
         logger.error(f"❌ Impossible de résoudre le canal {entity_id}: {e}")
         return None
-
-# ============================================================================
-# UTILITAIRES - Parsing messages
-# ============================================================================
-
-def is_message_finalized(message: str) -> bool:
-    return '✅' in message or '🔰' in message
-
-def extract_parentheses_groups(message: str) -> List[str]:
-    scored = re.findall(r"(\d+)?\(([^)]*)\)", message)
-    if scored:
-        return [f"{s}:{c}" if s else c for s, c in scored]
-    return re.findall(r"\(([^)]*)\)", message)
-
-def get_suits_in_group(group_str: str) -> List[str]:
-    if ':' in group_str:
-        group_str = group_str.split(':', 1)[1]
-    normalized = group_str
-    for old, new in [('❤️', '♥'), ('❤', '♥'), ('♥️', '♥'),
-                     ('♠️', '♠'), ('♦️', '♦'), ('♣️', '♣')]:
-        normalized = normalized.replace(old, new)
-    return [suit for suit in ALL_SUITS if suit in normalized]
 
 # ============================================================================
 # HISTORIQUE DES PRÉDICTIONS
@@ -175,7 +179,6 @@ async def send_prediction(game_number: int, suit: str, triggered_by_suit: str) -
 
         add_prediction_to_history(game_number, suit, triggered_by_suit)
 
-        # Si mode attente, verrouiller jusqu'à voir PERDU
         if attente_mode:
             attente_locked = True
 
@@ -235,7 +238,6 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
             logger.info(f"✅ Gagné: #{game_number} {suit} ({status})")
         else:
             logger.info(f"❌ Perdu: #{game_number} {suit}")
-            # Si mode attente → déverrouiller maintenant
             if attente_mode:
                 attente_locked = False
                 logger.info("🔓 Mode Attente: PERDU détecté → prêt pour prochaine prédiction")
@@ -246,53 +248,65 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
         logger.error(f"❌ Erreur update message: {e}")
 
 # ============================================================================
-# VÉRIFICATION DES RÉSULTATS
+# VÉRIFICATION DYNAMIQUE (dès que les cartes du joueur apparaissent)
 # ============================================================================
 
-async def check_prediction_result(game_number: int, first_group: str) -> bool:
-    """Vérifie si un jeu correspond à une prédiction en attente."""
-    suits_in_result = get_suits_in_group(first_group)
+async def check_prediction_result_dynamic(game_number: int, player_suits: List[str], is_finished: bool):
+    """Vérification dynamique des prédictions.
 
-    # Vérification directe
+    Règles :
+    - Si le costume prédit apparaît dans les cartes du joueur → gagné immédiatement
+      (même si la partie n'est pas encore totalement terminée côté banquier).
+    - Si pas trouvé ET partie joueur terminée (is_finished) → avancer rattrapage.
+    - Si pas trouvé ET partie encore en cours → ne rien faire, attendre le prochain poll.
+    """
+
+    # --- Vérification directe (jeu prédit = jeu en cours) ---
     if game_number in pending_predictions:
         pred = pending_predictions[game_number]
         if pred.get('awaiting_rattrapage', 0) == 0:
             target_suit = pred['suit']
-            logger.info(f"🔍 Vérif #{game_number}: {target_suit} dans {suits_in_result}")
+            status_flag = pred.get('check_done_direct', False)
+            if status_flag:
+                return  # déjà traité sur ce poll précédent
 
-            if target_suit in suits_in_result:
+            if target_suit in player_suits:
+                logger.info(f"🔍 [DYN] #{game_number}: {target_suit} ✅ trouvé chez joueur (en_cours={not is_finished})")
                 await update_prediction_message(game_number, '✅0️⃣', True)
-                return True
-            else:
+            elif is_finished:
                 pred['awaiting_rattrapage'] = 1
-                logger.info(f"❌ #{game_number} échoué → attente rattrapage #{game_number + 1}")
-                return False
+                logger.info(f"🔍 [DYN] #{game_number}: {target_suit} ❌ absent → rattrapage #{game_number + 1}")
+            else:
+                logger.debug(f"🔍 [DYN] #{game_number}: partie en cours, costume pas encore visible - attente")
+            return
 
-    # Vérification rattrapages
+    # --- Vérification rattrapages ---
     for original_game, pred in list(pending_predictions.items()):
         awaiting = pred.get('awaiting_rattrapage', 0)
-        if awaiting > 0 and game_number == original_game + awaiting:
-            target_suit = pred['suit']
-            logger.info(f"🔍 Vérif R{awaiting} #{game_number}: {target_suit}")
+        if awaiting <= 0:
+            continue
+        if game_number != original_game + awaiting:
+            continue
 
-            if target_suit in suits_in_result:
-                status = f'✅{awaiting}️⃣'
-                await update_prediction_message(original_game, status, True, awaiting)
-                return True
+        target_suit = pred['suit']
+
+        if target_suit in player_suits:
+            status = f'✅{awaiting}️⃣'
+            logger.info(f"🔍 [DYN] R{awaiting} #{game_number}: {target_suit} ✅ trouvé chez joueur")
+            await update_prediction_message(original_game, status, True, awaiting)
+        elif is_finished:
+            if awaiting < 2:
+                pred['awaiting_rattrapage'] = awaiting + 1
+                logger.info(f"🔍 [DYN] R{awaiting} #{game_number}: {target_suit} ❌ absent → R{awaiting+1} #{original_game + awaiting + 1}")
             else:
-                if awaiting < 2:
-                    pred['awaiting_rattrapage'] = awaiting + 1
-                    logger.info(f"❌ R{awaiting} échoué → attente R{awaiting+1} #{original_game + awaiting + 1}")
-                    return False
-                else:
-                    logger.info(f"❌ R2 échoué → prédiction perdue")
-                    await update_prediction_message(original_game, '❌', False)
-                    return False
-
-    return False
+                logger.info(f"🔍 [DYN] R2 #{game_number}: {target_suit} ❌ → prédiction perdue")
+                await update_prediction_message(original_game, '❌', False)
+        else:
+            logger.debug(f"🔍 [DYN] R{awaiting} #{game_number}: partie en cours - attente")
+        return
 
 # ============================================================================
-# COMPTEUR2 - Logique principale
+# COMPTEUR2 - Logique principale (costumes du joueur)
 # ============================================================================
 
 def get_compteur2_status_text() -> str:
@@ -303,7 +317,7 @@ def get_compteur2_status_text() -> str:
         f"📊 Compteur2: {status} | B={compteur2_b}",
         f"🎮 Dernier jeu reçu: {last_game_str}",
         "",
-        "Progression (absences):",
+        "Progression des absences (cartes joueur):",
     ]
 
     for suit in ALL_SUITS:
@@ -322,26 +336,21 @@ def get_compteur2_status_text() -> str:
 
     return "\n".join(lines)
 
-async def process_compteur2(game_number: int, suits_in_game: List[str]):
-    """Traite le Compteur2 pour un jeu reçu.
+async def process_compteur2(game_number: int, player_suits: List[str]):
+    """Traite le Compteur2 dès que la main du joueur est prête (≥2 cartes).
 
-    Compte uniquement les absences CONSÉCUTIVES (numéros de jeu qui se suivent)
-    dans le premier groupe de parenthèses.
-    Un jeu non-consécutif (numéro qui saute) remet le compteur d'absence à 1.
-    Un jeu déjà traité est ignoré pour éviter le double-comptage (new + edit).
+    Compte les absences consécutives des costumes dans les cartes du joueur.
+    Déclenche une prédiction sans attendre que la partie du banquier se termine.
     """
     global compteur2_absences, compteur2_last_game, compteur2_last_seen, compteur2_processed_games
 
     if not compteur2_active:
         return
 
-    # Ignorer les jeux déjà traités (évite le double-comptage new+edit)
     if game_number in compteur2_processed_games:
-        logger.info(f"📊 Compteur2 #{game_number}: déjà traité, ignoré")
         return
 
     compteur2_processed_games.add(game_number)
-    # Garder uniquement les 200 derniers jeux pour ne pas saturer la mémoire
     if len(compteur2_processed_games) > 200:
         oldest = min(compteur2_processed_games)
         compteur2_processed_games.discard(oldest)
@@ -351,19 +360,15 @@ async def process_compteur2(game_number: int, suits_in_game: List[str]):
     for suit in ALL_SUITS:
         last_seen = compteur2_last_seen.get(suit, 0)
 
-        if suit in suits_in_game:
-            # Costume présent → réinitialiser le compteur d'absence
+        if suit in player_suits:
             if compteur2_absences[suit] > 0:
-                logger.info(f"📊 Compteur2 {suit}: trouvé au jeu #{game_number} → reset (était {compteur2_absences[suit]})")
+                logger.info(f"📊 Compteur2 {suit}: trouvé au jeu #{game_number} (joueur) → reset (était {compteur2_absences[suit]})")
             compteur2_absences[suit] = 0
             compteur2_last_seen[suit] = game_number
         else:
-            # Costume absent — vérifier la consécutivité des numéros de jeu
             if last_seen == 0 or game_number == last_seen + 1:
-                # Consécutif (ou premier jeu vu) → incrémenter
                 compteur2_absences[suit] += 1
             else:
-                # Non-consécutif : le numéro a sauté → repartir à 1
                 logger.info(
                     f"📊 Compteur2 {suit}: jeu #{game_number} non-consécutif "
                     f"(précédent #{last_seen}) → compteur remis à 1"
@@ -372,14 +377,12 @@ async def process_compteur2(game_number: int, suits_in_game: List[str]):
 
             compteur2_last_seen[suit] = game_number
             count = compteur2_absences[suit]
-            logger.info(f"📊 Compteur2 {suit}: absence consécutive {count}/{compteur2_b} (jeu #{game_number})")
+            logger.info(f"📊 Compteur2 {suit}: absence joueur consécutive {count}/{compteur2_b} (jeu #{game_number})")
 
             if count >= compteur2_b:
-                # Seuil B atteint → prédire l'inverse
                 inverse_suit = SUIT_INVERSE.get(suit, suit)
                 pred_game = game_number + 1
 
-                # Si mode attente et verrouillé → ne pas prédire
                 if attente_mode and attente_locked:
                     logger.info(
                         f"🔒 Mode Attente verrouillé: B={compteur2_b} atteint pour {suit} "
@@ -389,81 +392,86 @@ async def process_compteur2(game_number: int, suits_in_game: List[str]):
                     continue
 
                 logger.info(
-                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS → prédiction inverse "
-                    f"{inverse_suit} pour #{pred_game}"
+                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS (joueur) "
+                    f"→ prédiction inverse {inverse_suit} pour #{pred_game} "
+                    f"[déclenchée dès main joueur prête]"
                 )
                 await send_prediction(pred_game, inverse_suit, suit)
                 compteur2_absences[suit] = 0
 
 # ============================================================================
-# TRAITEMENT DES MESSAGES SOURCE
+# BOUCLE DE POLLING API - DYNAMIQUE
 # ============================================================================
 
-async def process_game_result(game_number: int, message_text: str):
-    """Traite un résultat de jeu finalisé reçu du canal source."""
-    global current_game_number
+async def api_polling_loop():
+    """Interroge l'API 1xBet en continu.
 
-    current_game_number = game_number
+    Comportement dynamique :
+    - Compteur2 : déclenché dès que le joueur a ≥ 2 cartes (avant fin banquier).
+    - Vérification : dès qu'une carte joueur apparaît dans la partie attendue.
+      Si trouvée → résultat immédiat.
+      Si pas trouvée et partie joueur terminée → passe au rattrapage.
+      Si pas trouvée et partie en cours → attend le prochain poll.
+    """
+    global current_game_number, api_results_cache, player_processed_games
 
-    groups = extract_parentheses_groups(message_text)
-    if not groups:
-        logger.warning(f"⚠️ Pas de groupe trouvé dans #{game_number}")
-        return
+    loop = asyncio.get_event_loop()
+    logger.info(f"🔄 Polling API dynamique démarré (intervalle: {API_POLL_INTERVAL}s)")
 
-    first_group = groups[0]
-    suits_in_first = get_suits_in_group(first_group)
+    while True:
+        try:
+            results = await loop.run_in_executor(None, get_latest_results)
 
-    logger.info(f"📊 Jeu #{game_number}: couleurs={suits_in_first}")
+            if results:
+                for result in results:
+                    game_number = result["game_number"]
+                    is_finished = result["is_finished"]
+                    player_cards = result.get("player_cards", [])
 
-    # Vérifier les prédictions en attente
-    await check_prediction_result(game_number, first_group)
+                    # Mettre à jour le cache
+                    api_results_cache[game_number] = result
 
-    # Compteur2
-    await process_compteur2(game_number, suits_in_first)
+                    # Extraire costumes joueur
+                    player_suits = player_suits_from_cards(player_cards)
+                    ready = len(player_cards) >= 2
 
-async def handle_message(event, is_edit: bool = False):
-    """Gère les messages entrants et édités du canal source."""
-    try:
-        chat = await event.get_chat()
-        chat_id = chat.id
+                    if not ready:
+                        continue  # Pas encore de cartes joueur → attendre
 
-        if hasattr(chat, 'broadcast') and chat.broadcast:
-            if not str(chat_id).startswith('-100'):
-                chat_id = int(f"-100{abs(chat_id)}")
+                    current_game_number = game_number
 
-        normalized_source = normalize_channel_id(SOURCE_CHANNEL_ID)
-        if chat_id != normalized_source:
-            return
+                    p_display = " ".join(SUIT_DISPLAY.get(s, s) for s in player_suits) or "—"
 
-        message_text = event.message.message
-        edit_info = " [ÉDITÉ]" if is_edit else ""
-        logger.info(f"📨{edit_info} Msg {event.message.id}: {message_text[:60]}...")
+                    # ── 1. VÉRIFICATION DYNAMIQUE ──────────────────────────────
+                    # Dès que les cartes du joueur sont disponibles
+                    await check_prediction_result_dynamic(game_number, player_suits, is_finished)
 
-        if not is_message_finalized(message_text):
-            logger.info("⏳ Non finalisé ignoré")
-            return
+                    # ── 2. COMPTEUR2 ───────────────────────────────────────────
+                    # Déclencher une seule fois dès que le joueur a ≥ 2 cartes
+                    if game_number not in player_processed_games:
+                        player_processed_games.add(game_number)
+                        if len(player_processed_games) > 500:
+                            oldest = min(player_processed_games)
+                            player_processed_games.discard(oldest)
 
-        match = re.search(r"#N\s*(\d+)", message_text, re.IGNORECASE)
-        if not match:
-            match = re.search(r"(?:^|[^\d])(\d{3,4})(?:[^\d]|$)", message_text)
+                        logger.info(
+                            f"🃏 Jeu #{game_number} | Joueur: {p_display} "
+                            f"| Gagnant: {result.get('winner')} "
+                            f"| Terminé: {is_finished}"
+                        )
+                        await process_compteur2(game_number, player_suits)
 
-        if not match:
-            logger.warning("⚠️ Numéro non trouvé dans le message")
-            return
+                # Nettoyage du cache (garder 300 derniers)
+                if len(api_results_cache) > 300:
+                    oldest = min(api_results_cache.keys())
+                    del api_results_cache[oldest]
 
-        game_number = int(match.group(1))
-        await process_game_result(game_number, message_text)
+        except Exception as e:
+            logger.error(f"❌ Erreur polling API: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
-    except Exception as e:
-        logger.error(f"❌ Erreur handle_message: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-async def handle_new_message(event):
-    await handle_message(event, False)
-
-async def handle_edited_message(event):
-    await handle_message(event, True)
+        await asyncio.sleep(API_POLL_INTERVAL)
 
 # ============================================================================
 # RESET AUTOMATIQUE
@@ -486,6 +494,7 @@ async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
     global compteur2_absences, compteur2_last_game, attente_locked
     global compteur2_last_seen, compteur2_processed_games
+    global player_processed_games, api_results_cache
 
     stats = len(pending_predictions)
     pending_predictions.clear()
@@ -495,6 +504,8 @@ async def perform_full_reset(reason: str):
     compteur2_processed_games = set()
     compteur2_last_game = 0
     attente_locked = False
+    player_processed_games = set()
+    api_results_cache = {}
 
     logger.info(f"🔄 {reason} - {stats} prédictions cleared")
 
@@ -516,9 +527,8 @@ async def perform_full_reset(reason: str):
 # ============================================================================
 
 async def cmd_compteur2(event):
-    """Gère le Compteur2 - /compteur2 [on/off/b <val>/reset/status]."""
     global compteur2_active, compteur2_b, compteur2_absences, compteur2_last_game
-    global compteur2_last_seen, compteur2_processed_games
+    global compteur2_last_seen, compteur2_processed_games, player_processed_games
 
     if event.is_group or event.is_channel:
         return
@@ -539,23 +549,22 @@ async def cmd_compteur2(event):
         compteur2_absences = {suit: 0 for suit in ALL_SUITS}
         compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
         compteur2_processed_games = set()
+        player_processed_games = set()
         await event.respond(
             f"✅ Compteur2 ACTIVÉ | B={compteur2_b}\n\n" + get_compteur2_status_text()
         )
-        logger.info("Admin active Compteur2")
 
     elif arg == 'off':
         compteur2_active = False
         await event.respond("❌ Compteur2 DÉSACTIVÉ")
-        logger.info("Admin désactive Compteur2")
 
     elif arg == 'reset':
         compteur2_absences = {suit: 0 for suit in ALL_SUITS}
         compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
         compteur2_processed_games = set()
+        player_processed_games = set()
         compteur2_last_game = 0
         await event.respond("🔄 Compteur2 remis à zéro\n\n" + get_compteur2_status_text())
-        logger.info("Admin reset Compteur2")
 
     elif arg == 'b':
         if len(parts) < 3:
@@ -571,11 +580,11 @@ async def cmd_compteur2(event):
             compteur2_absences = {suit: 0 for suit in ALL_SUITS}
             compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
             compteur2_processed_games = set()
+            player_processed_games = set()
             await event.respond(
                 f"✅ Compteur2 B: {old_b} → {compteur2_b} | Compteurs remis à zéro\n\n"
                 + get_compteur2_status_text()
             )
-            logger.info(f"Admin change Compteur2 B={val}")
         except ValueError:
             await event.respond("❌ Valeur invalide. Usage: `/compteur2 b 4`")
     else:
@@ -589,9 +598,6 @@ async def cmd_compteur2(event):
         )
 
 async def cmd_attente(event):
-    """Mode Attente - attend PERDU avant de prédire à nouveau.
-    /attente [on/off/status]
-    """
     global attente_mode, attente_locked
 
     if event.is_group or event.is_channel:
@@ -609,11 +615,6 @@ async def cmd_attente(event):
             f"🕐 **MODE ATTENTE**\n\n"
             f"Statut: {mode_str}\n"
             f"État: {lock_str}\n\n"
-            f"**Fonctionnement:**\n"
-            f"• Prédit l'inverse quand B absences atteint\n"
-            f"• Après une prédiction, se verrouille\n"
-            f"• Se déverrouille uniquement quand il voit ❌PERDU\n"
-            f"• Sans PERDU → pas de nouvelle prédiction même si B atteint\n\n"
             f"`/attente on` — Activer\n"
             f"`/attente off` — Désactiver\n"
             f"`/attente reset` — Déverrouiller manuellement"
@@ -625,43 +626,27 @@ async def cmd_attente(event):
     if arg == 'on':
         attente_mode = True
         attente_locked = False
-        await event.respond(
-            "✅ **Mode Attente ACTIVÉ**\n\n"
-            "Le bot prédira une fois, puis attendra de voir ❌PERDU avant de prédire à nouveau.\n"
-            "État actuel: 🔓 Prêt pour la prochaine prédiction."
-        )
-        logger.info("Admin active mode Attente")
+        await event.respond("✅ **Mode Attente ACTIVÉ**\n\nÉtat actuel: 🔓 Prêt.")
 
     elif arg == 'off':
         attente_mode = False
         attente_locked = False
-        await event.respond(
-            "❌ **Mode Attente DÉSACTIVÉ**\n\n"
-            "Le bot prédira normalement à chaque fois que B absences est atteint."
-        )
-        logger.info("Admin désactive mode Attente")
+        await event.respond("❌ **Mode Attente DÉSACTIVÉ**")
 
     elif arg == 'reset':
         attente_locked = False
         status = "✅ ON" if attente_mode else "❌ OFF"
         await event.respond(
-            f"🔓 **Mode Attente déverrouillé manuellement**\n\n"
-            f"Mode Attente: {status}\n"
-            f"Le bot est prêt pour la prochaine prédiction."
+            f"🔓 **Mode Attente déverrouillé manuellement**\n\nMode Attente: {status}"
         )
-        logger.info("Admin déverrouille mode Attente")
-
     else:
         await event.respond(
             "🕐 **MODE ATTENTE - Aide**\n\n"
-            "`/attente` — Voir le statut\n"
-            "`/attente on` — Activer\n"
-            "`/attente off` — Désactiver\n"
+            "`/attente on/off` — Activer/désactiver\n"
             "`/attente reset` — Déverrouiller manuellement"
         )
 
 async def cmd_history(event):
-    """Affiche l'historique de toutes les prédictions."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -702,16 +687,12 @@ async def cmd_history(event):
         )
         lines.append("")
 
-    # Prédictions actives
     if pending_predictions:
         lines.append("**🔮 PRÉDICTIONS ACTIVES:**")
         for num, pred in sorted(pending_predictions.items()):
             suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
             ar = pred.get('awaiting_rattrapage', 0)
-            if ar > 0:
-                st = f"Attente R{ar} (#{num + ar})"
-            else:
-                st = "Vérification directe"
+            st = f"Attente R{ar} (#{num + ar})" if ar > 0 else "Vérification directe"
             lines.append(f"• Game #{num} {suit}: {st}")
         lines.append("")
 
@@ -719,26 +700,14 @@ async def cmd_history(event):
     await event.respond("\n".join(lines))
 
 async def cmd_channels(event):
-    """Vérifie la configuration et l'accès aux canaux."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
 
-    src_status = "❌"
-    src_name = "Inaccessible"
     pred_status = "❌"
     pred_name = "Inaccessible"
-
-    try:
-        if SOURCE_CHANNEL_ID:
-            src_entity = await resolve_channel(SOURCE_CHANNEL_ID)
-            if src_entity:
-                src_status = "✅"
-                src_name = getattr(src_entity, 'title', 'Sans titre')
-    except Exception as e:
-        src_status = f"❌ ({str(e)[:30]})"
 
     try:
         if PREDICTION_CHANNEL_ID:
@@ -750,16 +719,14 @@ async def cmd_channels(event):
         pred_status = f"❌ ({str(e)[:30]})"
 
     await event.respond(
-        f"📡 **CONFIGURATION DES CANAUX**\n\n"
-        f"**Canal Source:**\n"
-        f"ID: `{SOURCE_CHANNEL_ID}`\n"
-        f"Status: {src_status}\n"
-        f"Nom: {src_name}\n\n"
+        f"📡 **CONFIGURATION**\n\n"
+        f"**Source des données:** API 1xBet (polling {API_POLL_INTERVAL}s)\n"
+        f"**Jeux en cache:** {len(api_results_cache)}\n"
+        f"**Jeux traités (joueur):** {len(player_processed_games)}\n\n"
         f"**Canal Prédiction:**\n"
         f"ID: `{PREDICTION_CHANNEL_ID}`\n"
         f"Status: {pred_status}\n"
         f"Nom: {pred_name}\n\n"
-        f"⚠️ Le bot doit être **administrateur** du canal prédiction!\n\n"
         f"**Paramètres:**\n"
         f"Compteur2 B={compteur2_b} | Actif: {'✅' if compteur2_active else '❌'}\n"
         f"Mode Attente: {'✅ ON' if attente_mode else '❌ OFF'}\n"
@@ -767,7 +734,6 @@ async def cmd_channels(event):
     )
 
 async def cmd_test(event):
-    """Test d'envoi au canal de prédiction."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -786,7 +752,7 @@ async def cmd_test(event):
             await event.respond(
                 f"❌ **Canal inaccessible** `{PREDICTION_CHANNEL_ID}`\n\n"
                 f"Vérifiez:\n"
-                f"1. L'ID est correct (format: -100xxxxxxxxxx)\n"
+                f"1. L'ID est correct\n"
                 f"2. Le bot est administrateur du canal\n"
                 f"3. Le bot a les permissions d'envoi"
             )
@@ -814,23 +780,18 @@ async def cmd_test(event):
         pred_name_display = getattr(prediction_entity, 'title', str(prediction_entity.id))
         await event.respond(
             f"✅ **TEST RÉUSSI!**\n\n"
-            f"Canal: `{pred_name_display}` (ID: {prediction_entity.id})\n"
-            f"Envoi, modification et suppression: OK\n\n"
-            f"Les prédictions fonctionneront correctement."
+            f"Canal: `{pred_name_display}`\n"
+            f"Envoi, modification et suppression: OK"
         )
 
     except ChatWriteForbiddenError:
         await event.respond(
-            "❌ **Permission refusée**\n\n"
-            "Le bot ne peut pas écrire dans le canal.\n"
-            "→ Ajoutez le bot comme **administrateur** avec droit d'envoi."
+            "❌ **Permission refusée** — Ajoutez le bot comme administrateur."
         )
     except Exception as e:
-        logger.error(f"Erreur test: {e}")
         await event.respond(f"❌ Échec du test: {e}")
 
 async def cmd_reset(event):
-    """Reset manuel complet."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -842,7 +803,6 @@ async def cmd_reset(event):
     await event.respond("✅ Reset effectué! Compteurs remis à zéro.")
 
 async def cmd_status(event):
-    """Affiche l'état complet du bot."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -855,6 +815,8 @@ async def cmd_status(event):
         get_compteur2_status_text(),
         "",
         f"🔮 Prédictions actives: {len(pending_predictions)}",
+        f"📡 Source: API 1xBet (polling {API_POLL_INTERVAL}s)",
+        f"📦 Jeux en cache: {len(api_results_cache)}",
     ]
 
     if pending_predictions:
@@ -863,13 +825,12 @@ async def cmd_status(event):
             suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
             trig = SUIT_DISPLAY.get(pred['triggered_by'], pred['triggered_by'])
             ar = pred.get('awaiting_rattrapage', 0)
-            st = f"R{ar} en attente" if ar > 0 else "Vérification directe"
+            st = f"R{ar} en attente (#{num+ar})" if ar > 0 else "Vérification directe"
             lines.append(f"• Game #{num} {suit} (inverse de {trig}): {st}")
 
     await event.respond("\n".join(lines))
 
 async def cmd_announce(event):
-    """Annonce personnalisée dans le canal prédiction."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -909,40 +870,35 @@ async def cmd_announce(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_help(event):
-    """Affiche l'aide complète."""
     if event.is_group or event.is_channel:
         return
 
     await event.respond(
         "📖 **BACCARAT PREMIUM+2 - AIDE**\n\n"
         "**🎮 Système de prédiction (Compteur2):**\n"
-        "• Compte les absences consécutives de chaque couleur\n"
+        "• Lit les cartes du joueur depuis l'API 1xBet\n"
+        "• Compteur déclenché dès que le joueur a ≥2 cartes (sans attendre le banquier)\n"
         "• Quand une couleur atteint B absences → prédit l'**inverse**\n"
         "• ♠️↔♦️ | ❤️↔♣️\n\n"
+        "**🔍 Vérification dynamique:**\n"
+        "• Dès que les cartes du joueur apparaissent → vérifie la prédiction\n"
+        "• Costume trouvé → résultat immédiat (même si partie en cours)\n"
+        "• Pas trouvé et partie terminée → passe au rattrapage\n"
+        "• Pas trouvé et partie en cours → attend le prochain poll\n\n"
         "**🕐 Mode Attente:**\n"
-        "• Prédit une fois, puis attend de voir ❌PERDU\n"
-        "• Tant que PERDU non vu → pas de nouvelle prédiction\n\n"
+        "• Prédit une fois, puis attend de voir ❌PERDU\n\n"
         "**🔧 Commandes Admin:**\n"
         "`/compteur2` — État et gestion du Compteur2\n"
         "`/compteur2 on/off` — Activer/désactiver\n"
         "`/compteur2 b <val>` — Changer le seuil B\n"
-        "`/attente` — État du mode Attente\n"
-        "`/attente on/off` — Activer/désactiver le mode Attente\n"
-        "`/attente reset` — Déverrouiller manuellement\n"
-        "`/status` — État complet du bot\n"
-        "`/history` — Historique de toutes les prédictions\n"
-        "`/channels` — Vérifier les canaux\n"
-        "`/test` — Tester l'envoi au canal prédiction\n"
+        "`/attente on/off/reset` — Mode Attente\n"
+        "`/status` — État complet\n"
+        "`/history` — Historique des prédictions\n"
+        "`/channels` — Configuration\n"
+        "`/test` — Tester le canal\n"
         "`/reset` — Reset complet\n"
-        "`/announce <msg>` — Envoyer une annonce\n"
-        "`/help` — Cette aide\n\n"
-        "**📨 Format des prédictions:**\n"
-        "```\n"
-        "🎲𝐁𝐀𝐂𝐂𝐀𝐑𝐀 𝐏𝐑𝐄𝐌𝐈𝐔𝐌+2 ✨🎲\n"
-        "Game 4  :♠️\n\n"
-        "En cours de vérification\n"
-        "```\n"
-        "→ Mis à jour avec: Rattrapage :✅0️⃣ / ✅1️⃣ / ✅2️⃣ / ❌PERDU"
+        "`/announce <msg>` — Annonce\n"
+        "`/help` — Cette aide"
     )
 
 # ============================================================================
@@ -959,8 +915,6 @@ def setup_handlers():
     client.add_event_handler(cmd_channels, events.NewMessage(pattern=r'^/channels$'))
     client.add_event_handler(cmd_test, events.NewMessage(pattern=r'^/test$'))
     client.add_event_handler(cmd_announce, events.NewMessage(pattern=r'^/announce'))
-    client.add_event_handler(handle_new_message, events.NewMessage())
-    client.add_event_handler(handle_edited_message, events.MessageEdited())
 
 # ============================================================================
 # DÉMARRAGE
@@ -1000,7 +954,8 @@ async def main():
             return
 
         asyncio.create_task(auto_reset_system())
-        logger.info("🔄 Auto-reset démarré")
+        asyncio.create_task(api_polling_loop())
+        logger.info("🔄 Auto-reset et polling API dynamique démarrés")
 
         app = web.Application()
         app.router.add_get('/health', lambda r: web.Response(text="OK"))

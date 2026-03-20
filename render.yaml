@@ -15,8 +15,6 @@ services:
         sync: false
       - key: ADMIN_ID
         sync: false
-      - key: SOURCE_CHANNEL_ID
-        sync: false
       - key: PREDICTION_CHANNEL_ID
         sync: false
       - key: TELEGRAM_SESSION
@@ -25,3 +23,5 @@ services:
         value: "true"
       - key: COMPTEUR2_B
         value: "4"
+      - key: API_POLL_INTERVAL
+        value: "5"
