@@ -68,6 +68,12 @@ player_processed_games: set = set()
 # Cache des derniers résultats API {game_number: result_dict}
 api_results_cache: Dict[int, dict] = {}
 
+# Dernier numéro de jeu pour lequel une prédiction a été envoyée
+last_prediction_game: int = 0
+
+# Pour éviter de déclencher le reset plusieurs fois pour la partie 1440
+reset_done_for_cycle: bool = False
+
 # ============================================================================
 # UTILITAIRES - Costumes
 # ============================================================================
@@ -146,7 +152,7 @@ def update_prediction_history_status(game_number: int, suit: str, status: str, r
 
 async def send_prediction(game_number: int, suit: str, triggered_by_suit: str) -> Optional[int]:
     """Envoie une prédiction au canal."""
-    global last_prediction_time, attente_locked
+    global last_prediction_time, attente_locked, last_prediction_game
 
     if not PREDICTION_CHANNEL_ID:
         logger.error("❌ PREDICTION_CHANNEL_ID non configuré")
@@ -167,6 +173,7 @@ async def send_prediction(game_number: int, suit: str, triggered_by_suit: str) -
     try:
         sent = await client.send_message(prediction_entity, msg)
         last_prediction_time = datetime.now()
+        last_prediction_game = game_number
 
         pending_predictions[game_number] = {
             'suit': suit,
@@ -268,7 +275,7 @@ async def check_prediction_result_dynamic(game_number: int, player_suits: List[s
             target_suit = pred['suit']
             status_flag = pred.get('check_done_direct', False)
             if status_flag:
-                return  # déjà traité sur ce poll précédent
+                return
 
             if target_suit in player_suits:
                 logger.info(f"🔍 [DYN] #{game_number}: {target_suit} ✅ trouvé chez joueur (en_cours={not is_finished})")
@@ -316,6 +323,7 @@ def get_compteur2_status_text() -> str:
     lines = [
         f"📊 Compteur2: {status} | B={compteur2_b}",
         f"🎮 Dernier jeu reçu: {last_game_str}",
+        f"🎯 Dernière prédiction: #{last_prediction_game}" if last_prediction_game else "🎯 Dernière prédiction: Aucune",
         "",
         "Progression des absences (cartes joueur):",
     ]
@@ -337,10 +345,13 @@ def get_compteur2_status_text() -> str:
     return "\n".join(lines)
 
 async def process_compteur2(game_number: int, player_suits: List[str]):
-    """Traite le Compteur2 dès que la main du joueur est prête (≥2 cartes).
+    """Traite le Compteur2 après que la partie du joueur est terminée (is_finished=True).
 
-    Compte les absences consécutives des costumes dans les cartes du joueur.
-    Déclenche une prédiction sans attendre que la partie du banquier se termine.
+    Règles de prédiction :
+    - Attend qu'il n'y ait aucune prédiction en cours (pending_predictions vide).
+    - L'écart entre la dernière prédiction envoyée et la nouvelle doit être ≥ 2.
+    - Pas de prédiction pour deux numéros consécutifs.
+    - Pas de prédiction pour le même numéro deux fois (même si costumes différents).
     """
     global compteur2_absences, compteur2_last_game, compteur2_last_seen, compteur2_processed_games
 
@@ -383,6 +394,7 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                 inverse_suit = SUIT_INVERSE.get(suit, suit)
                 pred_game = game_number + 1
 
+                # ── Règle 1 : Mode Attente verrouillé ──────────────────────────
                 if attente_mode and attente_locked:
                     logger.info(
                         f"🔒 Mode Attente verrouillé: B={compteur2_b} atteint pour {suit} "
@@ -391,10 +403,37 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                     compteur2_absences[suit] = 0
                     continue
 
+                # ── Règle 2 : Attendre que toutes les vérifications soient faites ──
+                if pending_predictions:
+                    logger.info(
+                        f"⏸ Prédiction #{pred_game} {inverse_suit} ignorée: "
+                        f"vérification en cours pour {list(pending_predictions.keys())}"
+                    )
+                    compteur2_absences[suit] = 0
+                    continue
+
+                # ── Règle 3 : Écart minimum de 2 entre prédictions ──────────────
+                if last_prediction_game > 0 and pred_game < last_prediction_game + 2:
+                    logger.info(
+                        f"⏸ Prédiction #{pred_game} {inverse_suit} ignorée: "
+                        f"écart insuffisant (dernier prédit: #{last_prediction_game}, "
+                        f"écart requis: 2, écart actuel: {pred_game - last_prediction_game})"
+                    )
+                    compteur2_absences[suit] = 0
+                    continue
+
+                # ── Règle 4 : Pas de prédiction pour le même numéro deux fois ──
+                if pred_game == last_prediction_game:
+                    logger.info(
+                        f"⏸ Prédiction #{pred_game} {inverse_suit} ignorée: "
+                        f"game #{pred_game} déjà prédit"
+                    )
+                    compteur2_absences[suit] = 0
+                    continue
+
                 logger.info(
-                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS (joueur) "
-                    f"→ prédiction inverse {inverse_suit} pour #{pred_game} "
-                    f"[déclenchée dès main joueur prête]"
+                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS (joueur terminé) "
+                    f"→ prédiction inverse {inverse_suit} pour #{pred_game}"
                 )
                 await send_prediction(pred_game, inverse_suit, suit)
                 compteur2_absences[suit] = 0
@@ -406,14 +445,13 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
 async def api_polling_loop():
     """Interroge l'API 1xBet en continu.
 
-    Comportement dynamique :
-    - Compteur2 : déclenché dès que le joueur a ≥ 2 cartes (avant fin banquier).
-    - Vérification : dès qu'une carte joueur apparaît dans la partie attendue.
-      Si trouvée → résultat immédiat.
-      Si pas trouvée et partie joueur terminée → passe au rattrapage.
-      Si pas trouvée et partie en cours → attend le prochain poll.
+    Comportement :
+    - Vérification dynamique : dès que les cartes du joueur sont disponibles.
+    - Compteur2 : déclenché uniquement quand la partie est terminée (is_finished=True).
+    - Reset automatique : déclenché quand la partie #1440 est terminée.
     """
     global current_game_number, api_results_cache, player_processed_games
+    global reset_done_for_cycle
 
     loop = asyncio.get_event_loop()
     logger.info(f"🔄 Polling API dynamique démarré (intervalle: {API_POLL_INTERVAL}s)")
@@ -436,7 +474,7 @@ async def api_polling_loop():
                     ready = len(player_cards) >= 2
 
                     if not ready:
-                        continue  # Pas encore de cartes joueur → attendre
+                        continue
 
                     current_game_number = game_number
 
@@ -447,19 +485,29 @@ async def api_polling_loop():
                     await check_prediction_result_dynamic(game_number, player_suits, is_finished)
 
                     # ── 2. COMPTEUR2 ───────────────────────────────────────────
-                    # Déclencher une seule fois dès que le joueur a ≥ 2 cartes
-                    if game_number not in player_processed_games:
+                    # Déclenché UNIQUEMENT quand la partie est terminée (is_finished=True)
+                    if game_number not in player_processed_games and is_finished:
                         player_processed_games.add(game_number)
                         if len(player_processed_games) > 500:
                             oldest = min(player_processed_games)
                             player_processed_games.discard(oldest)
 
                         logger.info(
-                            f"🃏 Jeu #{game_number} | Joueur: {p_display} "
-                            f"| Gagnant: {result.get('winner')} "
-                            f"| Terminé: {is_finished}"
+                            f"🃏 Jeu #{game_number} TERMINÉ | Joueur: {p_display} "
+                            f"| Gagnant: {result.get('winner')}"
                         )
                         await process_compteur2(game_number, player_suits)
+
+                    # ── 3. RESET AUTOMATIQUE sur la partie #1440 ────────────────
+                    if game_number == 1440 and is_finished and not reset_done_for_cycle:
+                        reset_done_for_cycle = True
+                        logger.info("🔄 Reset automatique: partie #1440 terminée")
+                        await perform_full_reset("Reset automatique (partie #1440 terminée)")
+
+                    # Remettre à zéro le flag si on repart au début du cycle
+                    if game_number < 100 and reset_done_for_cycle:
+                        reset_done_for_cycle = False
+                        logger.info("🔄 Nouveau cycle détecté (game < 100) → flag reset remis à zéro")
 
                 # Nettoyage du cache (garder 300 derniers)
                 if len(api_results_cache) > 300:
@@ -474,31 +522,20 @@ async def api_polling_loop():
         await asyncio.sleep(API_POLL_INTERVAL)
 
 # ============================================================================
-# RESET AUTOMATIQUE
+# RESET COMPLET
 # ============================================================================
-
-async def auto_reset_system():
-    while True:
-        try:
-            now = datetime.now()
-            if now.hour == 1 and now.minute == 0:
-                logger.info("🕐 Reset automatique 1h00")
-                await perform_full_reset("Reset automatique 1h00")
-                await asyncio.sleep(60)
-            await asyncio.sleep(30)
-        except Exception as e:
-            logger.error(f"❌ Erreur auto_reset: {e}")
-            await asyncio.sleep(60)
 
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
     global compteur2_absences, compteur2_last_game, attente_locked
     global compteur2_last_seen, compteur2_processed_games
     global player_processed_games, api_results_cache
+    global last_prediction_game, reset_done_for_cycle
 
     stats = len(pending_predictions)
     pending_predictions.clear()
     last_prediction_time = None
+    last_prediction_game = 0
     compteur2_absences = {suit: 0 for suit in ALL_SUITS}
     compteur2_last_seen = {suit: 0 for suit in ALL_SUITS}
     compteur2_processed_games = set()
@@ -730,6 +767,8 @@ async def cmd_channels(event):
         f"**Paramètres:**\n"
         f"Compteur2 B={compteur2_b} | Actif: {'✅' if compteur2_active else '❌'}\n"
         f"Mode Attente: {'✅ ON' if attente_mode else '❌ OFF'}\n"
+        f"Dernière prédiction: #{last_prediction_game if last_prediction_game else 'Aucune'}\n"
+        f"Reset au jeu: #1440 (fin de partie)\n"
         f"Admin ID: `{ADMIN_ID}`"
     )
 
@@ -817,6 +856,7 @@ async def cmd_status(event):
         f"🔮 Prédictions actives: {len(pending_predictions)}",
         f"📡 Source: API 1xBet (polling {API_POLL_INTERVAL}s)",
         f"📦 Jeux en cache: {len(api_results_cache)}",
+        f"🔄 Reset automatique: partie #1440 terminée",
     ]
 
     if pending_predictions:
@@ -877,14 +917,20 @@ async def cmd_help(event):
         "📖 **BACCARAT PREMIUM+2 - AIDE**\n\n"
         "**🎮 Système de prédiction (Compteur2):**\n"
         "• Lit les cartes du joueur depuis l'API 1xBet\n"
-        "• Compteur déclenché dès que le joueur a ≥2 cartes (sans attendre le banquier)\n"
+        "• Compteur déclenché UNIQUEMENT quand la partie est terminée\n"
         "• Quand une couleur atteint B absences → prédit l'**inverse**\n"
         "• ♠️↔♦️ | ❤️↔♣️\n\n"
+        "**🛡️ Règles anti-spam prédictions:**\n"
+        "• Écart minimum de 2 entre les numéros de jeu prédits\n"
+        "• Pas de prédictions consécutives (ex: #20 puis #21)\n"
+        "• Un seul prédit à la fois (attend la vérification avant d'envoyer)\n"
+        "• Pas de doublon sur le même numéro de jeu\n\n"
         "**🔍 Vérification dynamique:**\n"
         "• Dès que les cartes du joueur apparaissent → vérifie la prédiction\n"
-        "• Costume trouvé → résultat immédiat (même si partie en cours)\n"
-        "• Pas trouvé et partie terminée → passe au rattrapage\n"
-        "• Pas trouvé et partie en cours → attend le prochain poll\n\n"
+        "• Costume trouvé → résultat immédiat\n"
+        "• Pas trouvé et partie terminée → passe au rattrapage (max 2)\n\n"
+        "**🔄 Reset automatique:**\n"
+        "• Se déclenche quand la partie #1440 est terminée\n\n"
         "**🕐 Mode Attente:**\n"
         "• Prédit une fois, puis attend de voir ❌PERDU\n\n"
         "**🔧 Commandes Admin:**\n"
@@ -942,6 +988,7 @@ async def start_bot():
                 logger.error(f"❌ Erreur vérification canal: {e}")
 
         logger.info(f"🤖 Bot démarré | Compteur2 B={compteur2_b} | Attente={'ON' if attente_mode else 'OFF'}")
+        logger.info(f"🔄 Reset automatique configuré: fin de la partie #1440")
         return True
 
     except Exception as e:
@@ -953,9 +1000,8 @@ async def main():
         if not await start_bot():
             return
 
-        asyncio.create_task(auto_reset_system())
         asyncio.create_task(api_polling_loop())
-        logger.info("🔄 Auto-reset et polling API dynamique démarrés")
+        logger.info("🔄 Polling API dynamique démarré")
 
         app = web.Application()
         app.router.add_get('/health', lambda r: web.Response(text="OK"))
