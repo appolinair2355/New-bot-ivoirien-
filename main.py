@@ -1,9 +1,11 @@
 import os
+import re
 import asyncio
 import logging
 import sys
+import traceback
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
@@ -73,6 +75,56 @@ last_prediction_game: int = 0
 
 # Pour éviter de déclencher le reset plusieurs fois pour la partie 1440
 reset_done_for_cycle: bool = False
+
+# ============================================================================
+# INTERVALLES HORAIRES - Prédictions autorisées (heure du Bénin = UTC+1)
+# ============================================================================
+
+BENIN_TZ = timezone(timedelta(hours=1))
+
+# Liste des intervalles autorisés: [{"start": HH, "end": HH}, ...]
+# Si la liste est vide, les prédictions sont toujours autorisées.
+prediction_intervals: List[Dict[str, int]] = []
+intervals_enabled: bool = False  # Désactivé par défaut (toujours autorisé)
+
+def is_prediction_allowed_now() -> bool:
+    """Vérifie si les prédictions sont autorisées à l'heure actuelle (heure Bénin)."""
+    if not intervals_enabled or not prediction_intervals:
+        return True
+    now_benin = datetime.now(BENIN_TZ)
+    current_hour = now_benin.hour
+    current_minute = now_benin.minute
+    current_total = current_hour * 60 + current_minute
+    for interval in prediction_intervals:
+        start_total = interval["start"] * 60
+        end_total = interval["end"] * 60
+        if start_total <= end_total:
+            if start_total <= current_total < end_total:
+                return True
+        else:
+            # Intervalle qui passe minuit (ex: 23h → 2h)
+            if current_total >= start_total or current_total < end_total:
+                return True
+    return False
+
+def get_intervals_status_text() -> str:
+    now_benin = datetime.now(BENIN_TZ)
+    status = "✅ ON" if intervals_enabled else "❌ OFF"
+    allowed = "✅ OUI" if is_prediction_allowed_now() else "🚫 NON"
+    lines = [
+        f"⏰ **Intervalles de prédiction**",
+        f"Mode restriction: {status}",
+        f"Heure Bénin actuelle: {now_benin.strftime('%H:%M')}",
+        f"Prédiction autorisée: {allowed}",
+        "",
+    ]
+    if prediction_intervals:
+        lines.append("Intervalles configurés:")
+        for i, iv in enumerate(prediction_intervals, 1):
+            lines.append(f"  {i}. {iv['start']:02d}h00 → {iv['end']:02d}h00")
+    else:
+        lines.append("Aucun intervalle défini (prédictions toujours autorisées si mode OFF)")
+    return "\n".join(lines)
 
 # ============================================================================
 # UTILITAIRES - Costumes
@@ -154,6 +206,15 @@ async def send_prediction(game_number: int, suit: str, triggered_by_suit: str) -
     """Envoie une prédiction au canal."""
     global last_prediction_time, attente_locked, last_prediction_game
 
+    # ── Vérification de l'intervalle horaire ──────────────────────────────────
+    if not is_prediction_allowed_now():
+        now_benin = datetime.now(BENIN_TZ)
+        logger.info(
+            f"⏰ Prédiction #{game_number} {suit} bloquée: hors intervalle autorisé "
+            f"(heure Bénin: {now_benin.strftime('%H:%M')})"
+        )
+        return None
+
     if not PREDICTION_CHANNEL_ID:
         logger.error("❌ PREDICTION_CHANNEL_ID non configuré")
         return None
@@ -216,16 +277,20 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
 
     if status == '✅0️⃣':
         result_line = "Rattrapage :✅0️⃣"
+        game_display = str(game_number)
     elif status == '✅1️⃣':
         result_line = "Rattrapage :✅1️⃣"
+        game_display = str(game_number)
     elif status == '✅2️⃣':
         result_line = "Rattrapage :✅2️⃣"
+        game_display = str(game_number)
     else:
         result_line = "Rattrapage : ❌PERDU"
+        game_display = f"#N{game_number}"
 
     new_msg = (
         f"🎲𝐁𝐀𝐂𝐂𝐀𝐑𝐀 𝐏𝐑𝐄𝐌𝐈𝐔𝐌+2 ✨🎲\n"
-        f"Game {game_number}  :{suit_display}\n\n"
+        f"Game {game_display}  :{suit_display}\n\n"
         f"{result_line}"
     )
 
@@ -273,9 +338,6 @@ async def check_prediction_result_dynamic(game_number: int, player_suits: List[s
         pred = pending_predictions[game_number]
         if pred.get('awaiting_rattrapage', 0) == 0:
             target_suit = pred['suit']
-            status_flag = pred.get('check_done_direct', False)
-            if status_flag:
-                return
 
             if target_suit in player_suits:
                 logger.info(f"🔍 [DYN] #{game_number}: {target_suit} ✅ trouvé chez joueur (en_cours={not is_finished})")
@@ -345,13 +407,15 @@ def get_compteur2_status_text() -> str:
     return "\n".join(lines)
 
 async def process_compteur2(game_number: int, player_suits: List[str]):
-    """Traite le Compteur2 après que la partie du joueur est terminée (is_finished=True).
+    """Traite le Compteur2 dès que le joueur a ses cartes (>= 2 cartes).
 
     Règles de prédiction :
+    - Déclenché dès que le joueur a pris ses cartes (sans attendre la fin du banquier).
     - Attend qu'il n'y ait aucune prédiction en cours (pending_predictions vide).
     - L'écart entre la dernière prédiction envoyée et la nouvelle doit être ≥ 2.
     - Pas de prédiction pour deux numéros consécutifs.
     - Pas de prédiction pour le même numéro deux fois (même si costumes différents).
+    - Si bloquée par intervalle horaire, le compteur n'est PAS réinitialisé.
     """
     global compteur2_absences, compteur2_last_game, compteur2_last_seen, compteur2_processed_games
 
@@ -432,11 +496,20 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                     continue
 
                 logger.info(
-                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS (joueur terminé) "
+                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS "
                     f"→ prédiction inverse {inverse_suit} pour #{pred_game}"
                 )
-                await send_prediction(pred_game, inverse_suit, suit)
-                compteur2_absences[suit] = 0
+                sent = await send_prediction(pred_game, inverse_suit, suit)
+                if sent is not None:
+                    # Prédiction envoyée avec succès → reset du compteur
+                    compteur2_absences[suit] = 0
+                else:
+                    # Bloquée (hors intervalle horaire) → on garde le compteur
+                    # pour qu'il puisse retenter au prochain jeu si besoin
+                    logger.info(
+                        f"⏰ Compteur2 {suit}: prédiction non envoyée (hors intervalle) "
+                        f"→ compteur conservé à {compteur2_absences[suit]}"
+                    )
 
 # ============================================================================
 # BOUCLE DE POLLING API - DYNAMIQUE
@@ -447,7 +520,7 @@ async def api_polling_loop():
 
     Comportement :
     - Vérification dynamique : dès que les cartes du joueur sont disponibles.
-    - Compteur2 : déclenché uniquement quand la partie est terminée (is_finished=True).
+    - Compteur2 : déclenché dès que le joueur a ses cartes (>= 2), sans attendre le banquier.
     - Reset automatique : déclenché quand la partie #1440 est terminée.
     """
     global current_game_number, api_results_cache, player_processed_games
@@ -485,16 +558,17 @@ async def api_polling_loop():
                     await check_prediction_result_dynamic(game_number, player_suits, is_finished)
 
                     # ── 2. COMPTEUR2 ───────────────────────────────────────────
-                    # Déclenché UNIQUEMENT quand la partie est terminée (is_finished=True)
-                    if game_number not in player_processed_games and is_finished:
+                    # Déclenché dès que le JOUEUR a terminé de prendre ses cartes
+                    # (ready=True = joueur a >= 2 cartes), sans attendre la fin du banquier.
+                    if game_number not in player_processed_games and ready:
                         player_processed_games.add(game_number)
                         if len(player_processed_games) > 500:
                             oldest = min(player_processed_games)
                             player_processed_games.discard(oldest)
 
                         logger.info(
-                            f"🃏 Jeu #{game_number} TERMINÉ | Joueur: {p_display} "
-                            f"| Gagnant: {result.get('winner')}"
+                            f"🃏 Jeu #{game_number} | Joueur a ses cartes: {p_display} "
+                            f"| Terminé: {is_finished}"
                         )
                         await process_compteur2(game_number, player_suits)
 
@@ -516,7 +590,6 @@ async def api_polling_loop():
 
         except Exception as e:
             logger.error(f"❌ Erreur polling API: {e}")
-            import traceback
             logger.error(traceback.format_exc())
 
         await asyncio.sleep(API_POLL_INTERVAL)
@@ -909,6 +982,119 @@ async def cmd_announce(event):
     except Exception as e:
         await event.respond(f"❌ Erreur: {e}")
 
+async def cmd_predi(event):
+    """Gestion des intervalles horaires de prédiction (heure du Bénin = UTC+1).
+
+    Commandes:
+      /predi                 — Afficher l'état et les intervalles
+      /predi+HH-HH           — Ajouter un intervalle (ex: /predi+12-15)
+      /predi del <N>         — Supprimer l'intervalle N
+      /predi clear           — Supprimer tous les intervalles
+      /predi on              — Activer la restriction par intervalles
+      /predi off             — Désactiver la restriction (toujours autorisé)
+    """
+    global prediction_intervals, intervals_enabled
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    raw = event.message.message.strip()
+
+    # Commande: /predi+HH-HH  ex: /predi+12-15  ou  /predi+1-4
+    add_match = re.match(r'^/predi\+(\d{1,2})-(\d{1,2})$', raw)
+    if add_match:
+        start_h = int(add_match.group(1))
+        end_h = int(add_match.group(2))
+        if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
+            await event.respond("❌ Heures invalides. Utilisez des valeurs entre 0 et 23.")
+            return
+        if start_h == end_h:
+            await event.respond("❌ L'heure de début et de fin ne peuvent pas être identiques.")
+            return
+        # Vérifier si l'intervalle existe déjà
+        for iv in prediction_intervals:
+            if iv["start"] == start_h and iv["end"] == end_h:
+                await event.respond(f"⚠️ L'intervalle {start_h:02d}h00→{end_h:02d}h00 existe déjà.")
+                return
+        prediction_intervals.append({"start": start_h, "end": end_h})
+        await event.respond(
+            f"✅ Intervalle ajouté: {start_h:02d}h00 → {end_h:02d}h00 (heure Bénin)\n\n"
+            + get_intervals_status_text()
+        )
+        return
+
+    parts = raw.split()
+
+    if len(parts) == 1:
+        await event.respond(
+            get_intervals_status_text() + "\n\n"
+            "**Commandes:**\n"
+            "`/predi+HH-HH` — Ajouter un intervalle (ex: `/predi+12-15`)\n"
+            "`/predi del <N>` — Supprimer l'intervalle N\n"
+            "`/predi clear` — Supprimer tous les intervalles\n"
+            "`/predi on` — Activer la restriction\n"
+            "`/predi off` — Désactiver la restriction"
+        )
+        return
+
+    arg = parts[1].lower()
+
+    if arg == "on":
+        intervals_enabled = True
+        await event.respond(
+            "✅ **Restriction horaire ACTIVÉE**\n\n"
+            + get_intervals_status_text()
+        )
+
+    elif arg == "off":
+        intervals_enabled = False
+        await event.respond(
+            "❌ **Restriction horaire DÉSACTIVÉE** — prédictions toujours autorisées\n\n"
+            + get_intervals_status_text()
+        )
+
+    elif arg == "clear":
+        prediction_intervals = []
+        await event.respond("🗑️ Tous les intervalles supprimés.\n\n" + get_intervals_status_text())
+
+    elif arg == "del":
+        if len(parts) < 3:
+            await event.respond("Usage: `/predi del <N>` (N = numéro de l'intervalle dans la liste)")
+            return
+        try:
+            idx = int(parts[2]) - 1
+            if not (0 <= idx < len(prediction_intervals)):
+                await event.respond(f"❌ Index invalide. Il y a {len(prediction_intervals)} intervalle(s).")
+                return
+            removed = prediction_intervals.pop(idx)
+            await event.respond(
+                f"🗑️ Intervalle {removed['start']:02d}h00→{removed['end']:02d}h00 supprimé.\n\n"
+                + get_intervals_status_text()
+            )
+        except ValueError:
+            await event.respond("❌ Numéro invalide.")
+
+    else:
+        await event.respond(
+            "⏰ **INTERVALLES - Aide**\n\n"
+            "`/predi` — Afficher l'état\n"
+            "`/predi+HH-HH` — Ajouter un intervalle (ex: `/predi+12-15`)\n"
+            "`/predi del <N>` — Supprimer l'intervalle N\n"
+            "`/predi clear` — Supprimer tous les intervalles\n"
+            "`/predi on` — Activer la restriction horaire\n"
+            "`/predi off` — Désactiver la restriction horaire\n\n"
+            "**Exemples:**\n"
+            "`/predi+12-15` → prédit de 12h à 15h\n"
+            "`/predi+20-21` → prédit de 20h à 21h\n"
+            "`/predi+1-4` → prédit de 1h à 4h\n"
+            "`/predi+23-3` → prédit de 23h à 3h (passe minuit)\n"
+            "Toutes les heures sont en heure du Bénin (UTC+1)"
+        )
+
+
 async def cmd_help(event):
     if event.is_group or event.is_channel:
         return
@@ -917,8 +1103,8 @@ async def cmd_help(event):
         "📖 **BACCARAT PREMIUM+2 - AIDE**\n\n"
         "**🎮 Système de prédiction (Compteur2):**\n"
         "• Lit les cartes du joueur depuis l'API 1xBet\n"
-        "• Compteur déclenché UNIQUEMENT quand la partie est terminée\n"
-        "• Quand une couleur atteint B absences → prédit l'**inverse**\n"
+        "• Compteur déclenché dès que le joueur a pris ses cartes\n"
+        "• Quand une couleur atteint B absences → prédit l'**inverse** pour le jeu SUIVANT\n"
         "• ♠️↔♦️ | ❤️↔♣️\n\n"
         "**🛡️ Règles anti-spam prédictions:**\n"
         "• Écart minimum de 2 entre les numéros de jeu prédits\n"
@@ -929,6 +1115,9 @@ async def cmd_help(event):
         "• Dès que les cartes du joueur apparaissent → vérifie la prédiction\n"
         "• Costume trouvé → résultat immédiat\n"
         "• Pas trouvé et partie terminée → passe au rattrapage (max 2)\n\n"
+        "**⏰ Intervalles horaires (heure Bénin):**\n"
+        "• Définir des créneaux où les prédictions sont autorisées\n"
+        "• Hors créneau → prédiction silencieusement ignorée\n\n"
         "**🔄 Reset automatique:**\n"
         "• Se déclenche quand la partie #1440 est terminée\n\n"
         "**🕐 Mode Attente:**\n"
@@ -938,6 +1127,8 @@ async def cmd_help(event):
         "`/compteur2 on/off` — Activer/désactiver\n"
         "`/compteur2 b <val>` — Changer le seuil B\n"
         "`/attente on/off/reset` — Mode Attente\n"
+        "`/predi` — Gérer les intervalles horaires\n"
+        "`/predi+HH-HH` — Ajouter un intervalle (ex: /predi+12-15)\n"
         "`/status` — État complet\n"
         "`/history` — Historique des prédictions\n"
         "`/channels` — Configuration\n"
@@ -954,6 +1145,7 @@ async def cmd_help(event):
 def setup_handlers():
     client.add_event_handler(cmd_compteur2, events.NewMessage(pattern=r'^/compteur2'))
     client.add_event_handler(cmd_attente, events.NewMessage(pattern=r'^/attente'))
+    client.add_event_handler(cmd_predi, events.NewMessage(pattern=r'^/predi'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
