@@ -56,6 +56,21 @@ compteur2_last_game = 0
 compteur2_last_seen: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 compteur2_processed_games: set = set()
 
+# Compteur3 - apparences consécutives par couleur (costumes du joueur)
+compteur3_active: bool = False
+compteur3_seuil: int = 3
+compteur3_appearances: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
+compteur3_last_appeared: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
+
+# Compteur4 - absences consécutives des paires inverses ensemble
+# Paire A : ♠ et ♦ absents ensemble | Paire B : ♥ et ♣ absents ensemble
+compteur4_active: bool = False
+compteur4_jj: int = 2
+compteur4_pair_a: int = 0   # compteur paire ♠+♦ absents ensemble
+compteur4_pair_b: int = 0   # compteur paire ♥+♣ absents ensemble
+compteur4_last_game_pair_a: int = 0
+compteur4_last_game_pair_b: int = 0
+
 # Mode Attente - attend PERDU avant de prédire à nouveau
 attente_mode = False
 attente_locked = False
@@ -284,6 +299,9 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
     elif status == '✅2️⃣':
         result_line = "Rattrapage :✅2️⃣"
         game_display = str(game_number)
+    elif status == '✅3️⃣':
+        result_line = "Rattrapage :✅3️⃣"
+        game_display = str(game_number)
     else:
         result_line = "Rattrapage : ❌PERDU"
         game_display = f"#N{game_number}"
@@ -364,11 +382,11 @@ async def check_prediction_result_dynamic(game_number: int, player_suits: List[s
             logger.info(f"🔍 [DYN] R{awaiting} #{game_number}: {target_suit} ✅ trouvé chez joueur")
             await update_prediction_message(original_game, status, True, awaiting)
         elif is_finished:
-            if awaiting < 2:
+            if awaiting < 3:
                 pred['awaiting_rattrapage'] = awaiting + 1
                 logger.info(f"🔍 [DYN] R{awaiting} #{game_number}: {target_suit} ❌ absent → R{awaiting+1} #{original_game + awaiting + 1}")
             else:
-                logger.info(f"🔍 [DYN] R2 #{game_number}: {target_suit} ❌ → prédiction perdue")
+                logger.info(f"🔍 [DYN] R3 #{game_number}: {target_suit} ❌ → prédiction perdue")
                 await update_prediction_message(original_game, '❌', False)
         else:
             logger.debug(f"🔍 [DYN] R{awaiting} #{game_number}: partie en cours - attente")
@@ -406,6 +424,37 @@ def get_compteur2_status_text() -> str:
 
     return "\n".join(lines)
 
+def get_compteur3_status_text() -> str:
+    status = "✅ ON" if compteur3_active else "❌ OFF"
+    lines = [
+        f"🔢 Compteur3: {status} | Seuil={compteur3_seuil}",
+        "",
+        "Progression des apparences consécutives (cartes joueur):",
+    ]
+    for suit in ALL_SUITS:
+        count = compteur3_appearances.get(suit, 0)
+        filled = '█' * count
+        empty = '░' * max(0, compteur3_seuil - count)
+        bar = f"[{filled}{empty}]"
+        display = SUIT_DISPLAY.get(suit, suit)
+        lines.append(f"{display} : {bar} {count}/{compteur3_seuil}")
+    return "\n".join(lines)
+
+def get_compteur4_status_text() -> str:
+    status = "✅ ON" if compteur4_active else "❌ OFF"
+    filled_a = '█' * compteur4_pair_a
+    empty_a  = '░' * max(0, compteur4_jj - compteur4_pair_a)
+    filled_b = '█' * compteur4_pair_b
+    empty_b  = '░' * max(0, compteur4_jj - compteur4_pair_b)
+    lines = [
+        f"🔲 Compteur4: {status} | JJ={compteur4_jj}",
+        "",
+        "Absences consécutives des paires inverses :",
+        f"♠️+♦️ : [{filled_a}{empty_a}] {compteur4_pair_a}/{compteur4_jj}",
+        f"❤️+♣️ : [{filled_b}{empty_b}] {compteur4_pair_b}/{compteur4_jj}",
+    ]
+    return "\n".join(lines)
+
 async def process_compteur2(game_number: int, player_suits: List[str]):
     """Traite le Compteur2 dès que le joueur a ses cartes (>= 2 cartes).
 
@@ -416,8 +465,12 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
     - Pas de prédiction pour deux numéros consécutifs.
     - Pas de prédiction pour le même numéro deux fois (même si costumes différents).
     - Si bloquée par intervalle horaire, le compteur n'est PAS réinitialisé.
+    - Si compteur3 activé : vérifie les apparences consécutives de l'inverse pour
+      décider si on prédit le manquant ou l'inverse.
     """
     global compteur2_absences, compteur2_last_game, compteur2_last_seen, compteur2_processed_games
+    global compteur3_appearances, compteur3_last_appeared
+    global compteur4_pair_a, compteur4_pair_b, compteur4_last_game_pair_a, compteur4_last_game_pair_b
 
     if not compteur2_active:
         return
@@ -436,11 +489,27 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
         last_seen = compteur2_last_seen.get(suit, 0)
 
         if suit in player_suits:
+            # ── Compteur2 : reset absence ──────────────────────────────────────
             if compteur2_absences[suit] > 0:
                 logger.info(f"📊 Compteur2 {suit}: trouvé au jeu #{game_number} (joueur) → reset (était {compteur2_absences[suit]})")
             compteur2_absences[suit] = 0
             compteur2_last_seen[suit] = game_number
+
+            # ── Compteur3 : incrémenter apparences consécutives ────────────────
+            last_app = compteur3_last_appeared.get(suit, 0)
+            if last_app == 0 or game_number == last_app + 1:
+                compteur3_appearances[suit] += 1
+            else:
+                compteur3_appearances[suit] = 1
+            compteur3_last_appeared[suit] = game_number
+            logger.debug(f"🔢 Compteur3 {suit}: apparence consécutive {compteur3_appearances[suit]}/{compteur3_seuil} (jeu #{game_number})")
         else:
+            # ── Compteur3 : reset apparences ──────────────────────────────────
+            if compteur3_appearances[suit] > 0:
+                logger.debug(f"🔢 Compteur3 {suit}: absent au jeu #{game_number} → reset apparences (était {compteur3_appearances[suit]})")
+            compteur3_appearances[suit] = 0
+
+            # ── Compteur2 : incrémenter absences consécutives ─────────────────
             if last_seen == 0 or game_number == last_seen + 1:
                 compteur2_absences[suit] += 1
             else:
@@ -458,11 +527,35 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                 inverse_suit = SUIT_INVERSE.get(suit, suit)
                 pred_game = game_number + 1
 
+                # ── Décision compteur3 : manquant ou inverse ? ─────────────────
+                if compteur3_active:
+                    inverse_appearances = compteur3_appearances.get(inverse_suit, 0)
+                    if inverse_appearances >= compteur3_seuil:
+                        pred_suit = suit
+                        logger.info(
+                            f"🔢 Compteur3 actif: {inverse_suit} apparu {inverse_appearances}x CONSÉCUTIFS "
+                            f"≥ seuil3={compteur3_seuil} + {suit} absent {count}x "
+                            f"→ prédiction MANQUANT {pred_suit} pour #{pred_game}"
+                        )
+                    else:
+                        pred_suit = inverse_suit
+                        logger.info(
+                            f"🔢 Compteur3 actif: {inverse_suit} apparu {inverse_appearances}x "
+                            f"< seuil3={compteur3_seuil} + {suit} absent {count}x "
+                            f"→ prédiction INVERSE {pred_suit} pour #{pred_game}"
+                        )
+                else:
+                    pred_suit = inverse_suit
+                    logger.info(
+                        f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS "
+                        f"→ prédiction inverse {pred_suit} pour #{pred_game}"
+                    )
+
                 # ── Règle 1 : Mode Attente verrouillé ──────────────────────────
                 if attente_mode and attente_locked:
                     logger.info(
                         f"🔒 Mode Attente verrouillé: B={compteur2_b} atteint pour {suit} "
-                        f"→ prédiction {inverse_suit} ignorée (attend PERDU)"
+                        f"→ prédiction {pred_suit} ignorée (attend PERDU)"
                     )
                     compteur2_absences[suit] = 0
                     continue
@@ -470,7 +563,7 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                 # ── Règle 2 : Attendre que toutes les vérifications soient faites ──
                 if pending_predictions:
                     logger.info(
-                        f"⏸ Prédiction #{pred_game} {inverse_suit} ignorée: "
+                        f"⏸ Prédiction #{pred_game} {pred_suit} ignorée: "
                         f"vérification en cours pour {list(pending_predictions.keys())}"
                     )
                     compteur2_absences[suit] = 0
@@ -479,7 +572,7 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                 # ── Règle 3 : Écart minimum de 2 entre prédictions ──────────────
                 if last_prediction_game > 0 and pred_game < last_prediction_game + 2:
                     logger.info(
-                        f"⏸ Prédiction #{pred_game} {inverse_suit} ignorée: "
+                        f"⏸ Prédiction #{pred_game} {pred_suit} ignorée: "
                         f"écart insuffisant (dernier prédit: #{last_prediction_game}, "
                         f"écart requis: 2, écart actuel: {pred_game - last_prediction_game})"
                     )
@@ -489,17 +582,36 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                 # ── Règle 4 : Pas de prédiction pour le même numéro deux fois ──
                 if pred_game == last_prediction_game:
                     logger.info(
-                        f"⏸ Prédiction #{pred_game} {inverse_suit} ignorée: "
+                        f"⏸ Prédiction #{pred_game} {pred_suit} ignorée: "
                         f"game #{pred_game} déjà prédit"
                     )
                     compteur2_absences[suit] = 0
                     continue
 
-                logger.info(
-                    f"🔮 Compteur2: {suit} absent {compteur2_b}x CONSÉCUTIFS "
-                    f"→ prédiction inverse {inverse_suit} pour #{pred_game}"
-                )
-                sent = await send_prediction(pred_game, inverse_suit, suit)
+                # ── Règle 5 : Compteur4 - paire d'inverses absente JJ fois ────
+                if compteur4_active:
+                    if suit in ('♠', '♦'):
+                        pair_count = compteur4_pair_a
+                        pair_label = "♠+♦"
+                    else:
+                        pair_count = compteur4_pair_b
+                        pair_label = "♥+♣"
+
+                    if pair_count >= compteur4_jj:
+                        logger.info(
+                            f"🔲 Compteur4: Paire {pair_label} absente ensemble "
+                            f"{pair_count}x ≥ JJ={compteur4_jj} "
+                            f"→ prédiction #{pred_game} {pred_suit} bloquée, attendre la prochaine"
+                        )
+                        # Réinitialiser la paire et le compteur2 pour ce costume
+                        if suit in ('♠', '♦'):
+                            compteur4_pair_a = 0
+                        else:
+                            compteur4_pair_b = 0
+                        compteur2_absences[suit] = 0
+                        continue
+
+                sent = await send_prediction(pred_game, pred_suit, suit)
                 if sent is not None:
                     # Prédiction envoyée avec succès → reset du compteur
                     compteur2_absences[suit] = 0
@@ -510,6 +622,36 @@ async def process_compteur2(game_number: int, player_suits: List[str]):
                         f"⏰ Compteur2 {suit}: prédiction non envoyée (hors intervalle) "
                         f"→ compteur conservé à {compteur2_absences[suit]}"
                     )
+
+    # ── Compteur4 : suivi des absences de paires (après la boucle par costume) ──
+    if compteur4_active:
+        pair_a_absent = '♠' not in player_suits and '♦' not in player_suits
+        if pair_a_absent:
+            if compteur4_last_game_pair_a == 0 or game_number == compteur4_last_game_pair_a + 1:
+                compteur4_pair_a += 1
+            else:
+                compteur4_pair_a = 1
+            compteur4_last_game_pair_a = game_number
+            logger.info(f"🔲 Compteur4 ♠+♦ absents ensemble: {compteur4_pair_a}/{compteur4_jj} (jeu #{game_number})")
+        else:
+            if compteur4_pair_a > 0:
+                logger.debug(f"🔲 Compteur4 ♠+♦: présent au jeu #{game_number} → reset")
+            compteur4_pair_a = 0
+            compteur4_last_game_pair_a = game_number
+
+        pair_b_absent = '♥' not in player_suits and '♣' not in player_suits
+        if pair_b_absent:
+            if compteur4_last_game_pair_b == 0 or game_number == compteur4_last_game_pair_b + 1:
+                compteur4_pair_b += 1
+            else:
+                compteur4_pair_b = 1
+            compteur4_last_game_pair_b = game_number
+            logger.info(f"🔲 Compteur4 ♥+♣ absents ensemble: {compteur4_pair_b}/{compteur4_jj} (jeu #{game_number})")
+        else:
+            if compteur4_pair_b > 0:
+                logger.debug(f"🔲 Compteur4 ♥+♣: présent au jeu #{game_number} → reset")
+            compteur4_pair_b = 0
+            compteur4_last_game_pair_b = game_number
 
 # ============================================================================
 # BOUCLE DE POLLING API - DYNAMIQUE
@@ -604,6 +746,8 @@ async def perform_full_reset(reason: str):
     global compteur2_last_seen, compteur2_processed_games
     global player_processed_games, api_results_cache
     global last_prediction_game, reset_done_for_cycle
+    global compteur3_appearances, compteur3_last_appeared
+    global compteur4_pair_a, compteur4_pair_b, compteur4_last_game_pair_a, compteur4_last_game_pair_b
 
     stats = len(pending_predictions)
     pending_predictions.clear()
@@ -616,6 +760,12 @@ async def perform_full_reset(reason: str):
     attente_locked = False
     player_processed_games = set()
     api_results_cache = {}
+    compteur3_appearances = {suit: 0 for suit in ALL_SUITS}
+    compteur3_last_appeared = {suit: 0 for suit in ALL_SUITS}
+    compteur4_pair_a = 0
+    compteur4_pair_b = 0
+    compteur4_last_game_pair_a = 0
+    compteur4_last_game_pair_b = 0
 
     logger.info(f"🔄 {reason} - {stats} prédictions cleared")
 
@@ -705,6 +855,164 @@ async def cmd_compteur2(event):
             "`/compteur2 off` — Désactiver\n"
             "`/compteur2 b <val>` — Changer le seuil B\n"
             "`/compteur2 reset` — Remettre les compteurs à zéro"
+        )
+
+async def cmd_compteur3(event):
+    global compteur3_active, compteur3_seuil, compteur3_appearances, compteur3_last_appeared
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    parts = event.message.message.strip().split()
+
+    if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == 'status'):
+        await event.respond(
+            get_compteur3_status_text() + "\n\n"
+            "**Commandes:**\n"
+            "`/compteur3 on` — Activer\n"
+            "`/compteur3 off` — Désactiver\n"
+            "`/compteur3 s <val>` — Changer le seuil (ex: `/compteur3 s 3`)\n"
+            "`/compteur3 reset` — Remettre les compteurs à zéro"
+        )
+        return
+
+    arg = parts[1].lower()
+
+    if arg == 'on':
+        compteur3_active = True
+        compteur3_appearances = {suit: 0 for suit in ALL_SUITS}
+        compteur3_last_appeared = {suit: 0 for suit in ALL_SUITS}
+        await event.respond(
+            f"✅ Compteur3 ACTIVÉ | Seuil={compteur3_seuil}\n\n"
+            + get_compteur3_status_text()
+        )
+
+    elif arg == 'off':
+        compteur3_active = False
+        await event.respond("❌ Compteur3 DÉSACTIVÉ\n\nLe bot prédit l'inverse dès que le manquant atteint B.")
+
+    elif arg == 'reset':
+        compteur3_appearances = {suit: 0 for suit in ALL_SUITS}
+        compteur3_last_appeared = {suit: 0 for suit in ALL_SUITS}
+        await event.respond("🔄 Compteur3 remis à zéro\n\n" + get_compteur3_status_text())
+
+    elif arg == 's':
+        if len(parts) < 3:
+            await event.respond("Usage: `/compteur3 s <valeur>` (ex: `/compteur3 s 3`)")
+            return
+        try:
+            val = int(parts[2])
+            if not 1 <= val <= 20:
+                await event.respond("❌ Le seuil doit être entre 1 et 20")
+                return
+            old_s = compteur3_seuil
+            compteur3_seuil = val
+            compteur3_appearances = {suit: 0 for suit in ALL_SUITS}
+            compteur3_last_appeared = {suit: 0 for suit in ALL_SUITS}
+            await event.respond(
+                f"✅ Compteur3 Seuil: {old_s} → {compteur3_seuil} | Compteurs remis à zéro\n\n"
+                + get_compteur3_status_text()
+            )
+        except ValueError:
+            await event.respond("❌ Valeur invalide. Usage: `/compteur3 s 3`")
+
+    else:
+        await event.respond(
+            "🔢 **COMPTEUR3 - Aide**\n\n"
+            "`/compteur3` — Afficher l'état\n"
+            "`/compteur3 on` — Activer\n"
+            "`/compteur3 off` — Désactiver\n"
+            "`/compteur3 s <val>` — Changer le seuil\n"
+            "`/compteur3 reset` — Remettre les compteurs à zéro"
+        )
+
+async def cmd_compteur4(event):
+    global compteur4_active, compteur4_jj
+    global compteur4_pair_a, compteur4_pair_b, compteur4_last_game_pair_a, compteur4_last_game_pair_b
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    parts = event.message.message.strip().split()
+
+    if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == 'status'):
+        await event.respond(
+            get_compteur4_status_text() + "\n\n"
+            "**Commandes:**\n"
+            "`/compteur4 on` — Activer\n"
+            "`/compteur4 off` — Désactiver\n"
+            "`/compteur4 jj <val>` — Changer le seuil JJ (ex: `/compteur4 jj 2`)\n"
+            "`/compteur4 reset` — Remettre les compteurs à zéro"
+        )
+        return
+
+    arg = parts[1].lower()
+
+    if arg == 'on':
+        compteur4_active = True
+        compteur4_pair_a = 0
+        compteur4_pair_b = 0
+        compteur4_last_game_pair_a = 0
+        compteur4_last_game_pair_b = 0
+        await event.respond(
+            f"✅ Compteur4 ACTIVÉ | JJ={compteur4_jj}\n\n"
+            + get_compteur4_status_text()
+        )
+
+    elif arg == 'off':
+        compteur4_active = False
+        await event.respond(
+            "❌ Compteur4 DÉSACTIVÉ\n\n"
+            "Les prédictions ne sont plus bloquées par les paires inverses absentes."
+        )
+
+    elif arg == 'reset':
+        compteur4_pair_a = 0
+        compteur4_pair_b = 0
+        compteur4_last_game_pair_a = 0
+        compteur4_last_game_pair_b = 0
+        await event.respond("🔄 Compteur4 remis à zéro\n\n" + get_compteur4_status_text())
+
+    elif arg == 'jj':
+        if len(parts) < 3:
+            await event.respond("Usage: `/compteur4 jj <valeur>` (ex: `/compteur4 jj 2`)")
+            return
+        try:
+            val = int(parts[2])
+            if not 1 <= val <= 20:
+                await event.respond("❌ JJ doit être entre 1 et 20")
+                return
+            old_jj = compteur4_jj
+            compteur4_jj = val
+            compteur4_pair_a = 0
+            compteur4_pair_b = 0
+            compteur4_last_game_pair_a = 0
+            compteur4_last_game_pair_b = 0
+            await event.respond(
+                f"✅ Compteur4 JJ: {old_jj} → {compteur4_jj} | Compteurs remis à zéro\n\n"
+                + get_compteur4_status_text()
+            )
+        except ValueError:
+            await event.respond("❌ Valeur invalide. Usage: `/compteur4 jj 2`")
+
+    else:
+        await event.respond(
+            "🔲 **COMPTEUR4 - Aide**\n\n"
+            "`/compteur4` — Afficher l'état\n"
+            "`/compteur4 on` — Activer\n"
+            "`/compteur4 off` — Désactiver\n"
+            "`/compteur4 jj <val>` — Changer le seuil JJ\n"
+            "`/compteur4 reset` — Remettre les compteurs à zéro\n\n"
+            "**Logique:**\n"
+            "• Compte les jeux consécutifs où ♠️+♦️ sont absents **ensemble**\n"
+            "• Compte les jeux consécutifs où ❤️+♣️ sont absents **ensemble**\n"
+            "• Si une paire atteint JJ → bloque la prédiction, attend la prochaine"
         )
 
 async def cmd_attente(event):
@@ -926,6 +1234,10 @@ async def cmd_status(event):
         "",
         get_compteur2_status_text(),
         "",
+        get_compteur3_status_text(),
+        "",
+        get_compteur4_status_text(),
+        "",
         f"🔮 Prédictions actives: {len(pending_predictions)}",
         f"📡 Source: API 1xBet (polling {API_POLL_INTERVAL}s)",
         f"📦 Jeux en cache: {len(api_results_cache)}",
@@ -1106,6 +1418,16 @@ async def cmd_help(event):
         "• Compteur déclenché dès que le joueur a pris ses cartes\n"
         "• Quand une couleur atteint B absences → prédit l'**inverse** pour le jeu SUIVANT\n"
         "• ♠️↔♦️ | ❤️↔♣️\n\n"
+        "**🔢 Compteur3 (optionnel) — Apparences consécutives:**\n"
+        "• Compte combien de fois de suite un costume apparaît\n"
+        "• Quand compteur3 est **OFF** : prédit toujours l'inverse du manquant\n"
+        "• Quand compteur3 est **ON** :\n"
+        "  – Si l'inverse du manquant a atteint le seuil3 → prédit le **manquant**\n"
+        "  – Sinon → prédit l'**inverse** (comportement normal)\n\n"
+        "**🔲 Compteur4 (optionnel) — Paires inverses absentes :**\n"
+        "• Surveille si ♠️+♦️ sont absents **ensemble** JJ fois de suite\n"
+        "• Surveille si ❤️+♣️ sont absents **ensemble** JJ fois de suite\n"
+        "• Si le seuil JJ est atteint → bloque la prédiction, attend la suivante\n\n"
         "**🛡️ Règles anti-spam prédictions:**\n"
         "• Écart minimum de 2 entre les numéros de jeu prédits\n"
         "• Pas de prédictions consécutives (ex: #20 puis #21)\n"
@@ -1114,7 +1436,7 @@ async def cmd_help(event):
         "**🔍 Vérification dynamique:**\n"
         "• Dès que les cartes du joueur apparaissent → vérifie la prédiction\n"
         "• Costume trouvé → résultat immédiat\n"
-        "• Pas trouvé et partie terminée → passe au rattrapage (max 2)\n\n"
+        "• Pas trouvé et partie terminée → passe au rattrapage (max 3)\n\n"
         "**⏰ Intervalles horaires (heure Bénin):**\n"
         "• Définir des créneaux où les prédictions sont autorisées\n"
         "• Hors créneau → prédiction silencieusement ignorée\n\n"
@@ -1126,6 +1448,12 @@ async def cmd_help(event):
         "`/compteur2` — État et gestion du Compteur2\n"
         "`/compteur2 on/off` — Activer/désactiver\n"
         "`/compteur2 b <val>` — Changer le seuil B\n"
+        "`/compteur3` — État et gestion du Compteur3\n"
+        "`/compteur3 on/off` — Activer/désactiver\n"
+        "`/compteur3 s <val>` — Changer le seuil (défaut: 3)\n"
+        "`/compteur4` — État et gestion du Compteur4\n"
+        "`/compteur4 on/off` — Activer/désactiver\n"
+        "`/compteur4 jj <val>` — Changer le seuil JJ (défaut: 2)\n"
         "`/attente on/off/reset` — Mode Attente\n"
         "`/predi` — Gérer les intervalles horaires\n"
         "`/predi+HH-HH` — Ajouter un intervalle (ex: /predi+12-15)\n"
@@ -1144,6 +1472,8 @@ async def cmd_help(event):
 
 def setup_handlers():
     client.add_event_handler(cmd_compteur2, events.NewMessage(pattern=r'^/compteur2'))
+    client.add_event_handler(cmd_compteur3, events.NewMessage(pattern=r'^/compteur3'))
+    client.add_event_handler(cmd_compteur4, events.NewMessage(pattern=r'^/compteur4'))
     client.add_event_handler(cmd_attente, events.NewMessage(pattern=r'^/attente'))
     client.add_event_handler(cmd_predi, events.NewMessage(pattern=r'^/predi'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
