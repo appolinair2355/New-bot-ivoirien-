@@ -1,4 +1,3 @@
-import os
 import re
 import asyncio
 import logging
@@ -15,7 +14,9 @@ from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
     PREDICTION_CHANNEL_ID, PORT, API_POLL_INTERVAL,
     ALL_SUITS, SUIT_DISPLAY, SUIT_INVERSE,
-    COMPTEUR2_ACTIVE, COMPTEUR2_B
+    COMPTEUR2_ACTIVE, COMPTEUR2_B, TELEGRAM_SESSION,
+    COMPTEUR3_ACTIVE, COMPTEUR3_SEUIL,
+    COMPTEUR4_ACTIVE, COMPTEUR4_JJ
 )
 from utils import get_latest_results
 
@@ -57,15 +58,15 @@ compteur2_last_seen: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 compteur2_processed_games: set = set()
 
 # Compteur3 - apparences consécutives par couleur (costumes du joueur)
-compteur3_active: bool = False
-compteur3_seuil: int = 3
+compteur3_active: bool = COMPTEUR3_ACTIVE
+compteur3_seuil: int = COMPTEUR3_SEUIL
 compteur3_appearances: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 compteur3_last_appeared: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 
 # Compteur4 - absences consécutives des paires inverses ensemble
 # Paire A : ♠ et ♦ absents ensemble | Paire B : ♥ et ♣ absents ensemble
-compteur4_active: bool = False
-compteur4_jj: int = 2
+compteur4_active: bool = COMPTEUR4_ACTIVE
+compteur4_jj: int = COMPTEUR4_JJ
 compteur4_pair_a: int = 0   # compteur paire ♠+♦ absents ensemble
 compteur4_pair_b: int = 0   # compteur paire ♥+♣ absents ensemble
 compteur4_last_game_pair_a: int = 0
@@ -1407,6 +1408,33 @@ async def cmd_predi(event):
         )
 
 
+async def cmd_start(event):
+    if event.is_group or event.is_channel:
+        return
+
+    await event.respond(
+        "🎰 **Bienvenue sur le Bot de Manou !**\n\n"
+        "✨ **Bot de Prédiction Baccarat — Fiable & Précis**\n\n"
+        "Ce bot est l'outil ultime pour vos prédictions Baccarat.\n"
+        "Grâce à un algorithme intelligent basé sur l'analyse des absences\n"
+        "et apparences de costumes, il prédit avec une fiabilité remarquable\n"
+        "le prochain résultat — et met à jour automatiquement chaque prédiction\n"
+        "en temps réel dès que le résultat tombe. 🔥\n\n"
+        "📊 Stratégies avancées (Compteur2, Compteur3, Compteur4)\n"
+        "⚡ Vérification dynamique des résultats\n"
+        "🕐 Gestion des intervalles horaires (heure Bénin)\n"
+        "🔄 Reset automatique intelligent\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📖 Tapez /help pour voir toutes les commandes disponibles.\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👨‍💻 **Bot de Manou : SOSSOU Kouamé**\n"
+        "📞 +22995501564\n"
+        "📩 Telegram : @Kouamappoloak\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "_Pour tout problème, contactez le développeur directement sur Telegram._"
+    )
+
+
 async def cmd_help(event):
     if event.is_group or event.is_channel:
         return
@@ -1478,6 +1506,7 @@ def setup_handlers():
     client.add_event_handler(cmd_predi, events.NewMessage(pattern=r'^/predi'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
+    client.add_event_handler(cmd_start, events.NewMessage(pattern=r'^/start$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
     client.add_event_handler(cmd_channels, events.NewMessage(pattern=r'^/channels$'))
@@ -1491,8 +1520,7 @@ def setup_handlers():
 async def start_bot():
     global client, prediction_channel_ok
 
-    session = os.getenv('TELEGRAM_SESSION', '')
-    client = TelegramClient(StringSession(session), API_ID, API_HASH)
+    client = TelegramClient(StringSession(TELEGRAM_SESSION), API_ID, API_HASH)
 
     try:
         await client.start(bot_token=BOT_TOKEN)
