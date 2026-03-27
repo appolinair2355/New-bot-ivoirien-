@@ -1,55 +1,86 @@
 # config.py
 """
 Configuration BACCARAT AI 🤖
+Définissez toutes les variables d environnement ci-dessous sur votre plateforme
+avant de lancer le bot.
+
+Variables obligatoires :
+  - ADMIN_ID
+  - PREDICTION_CHANNEL_ID
+  - API_ID
+  - API_HASH
+  - BOT_TOKEN
+
+Variables optionnelles :
+  - TELEGRAM_SESSION   (laisser vide pour session automatique)
+  - PORT               (defaut : 10000)
+  - API_POLL_INTERVAL  (defaut : 5)
+  - COMPTEUR2_ACTIVE   (defaut : true)
+  - COMPTEUR2_B        (defaut : 4)
+  - COMPTEUR3_ACTIVE   (defaut : true)
+  - COMPTEUR3_SEUIL    (defaut : 3)
+  - COMPTEUR4_ACTIVE   (defaut : true)
+  - COMPTEUR4_JJ       (defaut : 2)
 """
 
 import os
 
-def parse_channel_id(env_var: str, default: str) -> int:
-    """Parse l'ID de canal Telegram."""
-    value = os.getenv(env_var) or default
+def parse_channel_id(value: str) -> int:
     try:
         channel_id = int(value)
         if channel_id > 0 and len(str(channel_id)) >= 10:
             channel_id = -channel_id
         return channel_id
     except:
-        return int(default)
+        raise ValueError(f"ID de canal invalide : {value}")
 
-# Canal de prédiction uniquement
-PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003336559159')
+# ============================================================================
+# VARIABLES D ENVIRONNEMENT - OBLIGATOIRES
+# ============================================================================
 
-# Authentification
-ADMIN_ID = int(os.getenv('ADMIN_ID') or '1190237801')
-API_ID = int(os.getenv('API_ID') or '29177661')
-API_HASH = os.getenv('API_HASH') or 'a8639172fa8d35dbfd8ea46286d349ab'
-BOT_TOKEN = os.getenv('BOT_TOKEN') or '8678647348:AAEJ10XquGFuSqViWiQFfXvK-iJHYPfbM2o'
-TELEGRAM_SESSION = os.getenv('TELEGRAM_SESSION') or '1BJWap1wBu0g_phkaACyeK4R57GPHlcjVwwS3mQzXXyagAq1qBHiWShyY2pDHYScRds6c_7Ug6xZnH6DjwQ19dttKvZ7FXhQTfIagaDV2p1sH_UWOlhiBIeVMuuH9PuaqhVRj073jrQZwIvalHgysDFptv2XXEYfXb7ipc-I3TgnIY_IZe0ZJA8cCm6kD7SjZviFQpCVzH6vt1oKj_Qrh2nF2JirC2qj2qAenYCzZmB7qwuP6tWaT6pgbEGdpnxvfwYiLf9q_ml9l18eUMt1BrH3CSYyeMa4JBqvDcz3rSngBAsAUjif2xfkuw-RB4WSkkgo0E8xp8h7gqwcwUbUhXDKTGng7VE0='
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PREDICTION_CHANNEL_ID = parse_channel_id(os.getenv("PREDICTION_CHANNEL_ID", "0"))
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "")
 
-# Serveur (Render.com utilise le port 10000 par défaut)
-PORT = int(os.getenv('PORT') or '10000')
+# ============================================================================
+# PARAMETRES DU BOT
+# ============================================================================
 
-# Polling API (secondes entre chaque appel)
-API_POLL_INTERVAL = int(os.getenv('API_POLL_INTERVAL') or '5')
+# Port du serveur health check — prend le port de la plateforme, sinon 10000
+PORT = int(os.getenv("PORT", "10000"))
+API_POLL_INTERVAL = int(os.getenv("API_POLL_INTERVAL", "5"))
 
-# Compteur2 - compteur d'absences consécutives
-COMPTEUR2_ACTIVE = os.getenv('COMPTEUR2_ACTIVE', 'true').lower() == 'true'
-COMPTEUR2_B = int(os.getenv('COMPTEUR2_B') or '4')
+# Compteur2 — absences consecutives
+COMPTEUR2_ACTIVE = os.getenv("COMPTEUR2_ACTIVE", "true").lower() == "true"
+COMPTEUR2_B = int(os.getenv("COMPTEUR2_B", "4"))
 
-# Couleurs (costumes du joueur)
-ALL_SUITS = ['♠', '♥', '♦', '♣']
+# Compteur3 — apparences consecutives de l inverse (active par defaut)
+COMPTEUR3_ACTIVE = os.getenv("COMPTEUR3_ACTIVE", "true").lower() == "true"
+COMPTEUR3_SEUIL = int(os.getenv("COMPTEUR3_SEUIL", "3"))
+
+# Compteur4 — paires inverses absentes ensemble (active par defaut)
+COMPTEUR4_ACTIVE = os.getenv("COMPTEUR4_ACTIVE", "true").lower() == "true"
+COMPTEUR4_JJ = int(os.getenv("COMPTEUR4_JJ", "2"))
+
+# ============================================================================
+# CONSTANTES — NE PAS MODIFIER
+# ============================================================================
+
+ALL_SUITS = ["♠", "♥", "♦", "♣"]
 
 SUIT_DISPLAY = {
-    '♠': '♠️',
-    '♥': '❤️',
-    '♦': '♦️',
-    '♣': '♣️'
+    "♠": "♠️",
+    "♥": "❤️",
+    "♦": "♦️",
+    "♣": "♣️"
 }
 
-# Inverse des couleurs (pour les prédictions Compteur2)
 SUIT_INVERSE = {
-    '♠': '♦',
-    '♦': '♠',
-    '♥': '♣',
-    '♣': '♥',
+    "♠": "♦",
+    "♦": "♠",
+    "♥": "♣",
+    "♣": "♥",
 }
