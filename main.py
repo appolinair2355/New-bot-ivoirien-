@@ -11,10 +11,11 @@ from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
 from aiohttp import web
 
 from config import (
-    API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
+    API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS,
     PREDICTION_CHANNEL_ID, PORT, API_POLL_INTERVAL,
     ALL_SUITS, SUIT_DISPLAY, TELEGRAM_SESSION,
-    C1_SILENT_CHANNEL_ID
+    C1_B, C1_SILENT_MAX_RATTRAPAGE, C1_CANAL_MAX_RATTRAPAGE,
+    MAX_SILENT_HISTORY
 )
 from utils import get_latest_results
 
@@ -43,7 +44,6 @@ client = None
 current_game_number = 0
 
 silent_history: List[Dict] = []
-MAX_SILENT_HISTORY = 150
 
 api_results_cache: Dict[int, dict] = {}
 player_processed_games: set = set()
@@ -51,19 +51,34 @@ reset_done_for_cycle: bool = False
 
 # ============================================================================
 # COMPTEUR1
-# B=3 | silencieux (rattrapage 1) → canal après 1 perte silencieuse (rattrapage 2)
-# Mapping: ♣→♦, ♦→♣, ♠→♥, ♥→♠
+# Toutes les prédictions vont directement dans le canal (R max C1_CANAL_MAX_RATTRAPAGE)
+# Prédiction = costume manquant lui-même | B modifiable via /compteur1 b <n>
 # ============================================================================
 
-C1_B = 3
-C1_SUIT_MAP = {'♣': '♦', '♦': '♣', '♠': '♥', '♥': '♠'}
-
 c1_active: bool = True
+c1_b: int = C1_B                  # modifiable via /compteur1 b <n>
 c1_absences: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 c1_processed_games: set = set()
-c1_consec_losses: int = 0        # pertes silencieuses consécutives
-c1_pending_silent: Dict[int, dict] = {}   # prédictions silencieuses en attente
 c1_pending_canal: Dict[int, dict] = {}    # prédictions canal en attente
+
+# ============================================================================
+# MODES INVERSE
+# 0 = désactivé (prédit le manque), 1/2/3 = cas inverse actif
+# ============================================================================
+
+INVERSE_MAPS: Dict[int, Dict[str, str]] = {
+    1: {'♠': '♣', '♣': '♠', '♥': '♦', '♦': '♥'},
+    2: {'♥': '♣', '♣': '♥', '♦': '♠', '♠': '♦'},
+    3: {'♦': '♣', '♣': '♦', '♠': '♥', '♥': '♠'},
+}
+
+INVERSE_LABELS: Dict[int, str] = {
+    1: "Cas 1 : ♠️↔♣️ | ❤️↔♦️",
+    2: "Cas 2 : ❤️↔♣️ | ♦️↔♠️",
+    3: "Cas 3 : ♦️↔♣️ | ♠️↔❤️",
+}
+
+c1_inverse_case: int = 0  # 0 = désactivé
 
 # ============================================================================
 # INTERVALLES HORAIRES
@@ -196,32 +211,7 @@ def build_result_msg(game_number: int, suit: str, trouve: bool, rattrapage: int)
     )
 
 # ============================================================================
-# ENVOI PRÉDICTIONS SILENCIEUSES (rattrapage max 1)
-# ============================================================================
-
-async def send_silent_prediction(game_number: int, suit: str, triggered_by: str) -> dict:
-    result = {'msg_id': None}
-    entity = await resolve_channel(C1_SILENT_CHANNEL_ID)
-    if entity:
-        try:
-            sent = await client.send_message(entity, build_prediction_msg(game_number, suit))
-            result['msg_id'] = sent.id
-            logger.info(f"🔕 [SILENT] #{game_number} {SUIT_DISPLAY.get(suit, suit)} → canal silencieux")
-        except Exception as e:
-            logger.error(f"❌ Erreur canal silencieux: {e}")
-    return result
-
-async def update_silent_message(pred: dict, game_number: int, suit: str, trouve: bool, rattrapage: int):
-    if pred.get('msg_id') and C1_SILENT_CHANNEL_ID:
-        entity = await resolve_channel(C1_SILENT_CHANNEL_ID)
-        if entity:
-            try:
-                await client.edit_message(entity, pred['msg_id'], build_result_msg(game_number, suit, trouve, rattrapage))
-            except Exception as e:
-                logger.error(f"❌ Erreur update silencieux: {e}")
-
-# ============================================================================
-# ENVOI PRÉDICTIONS CANAL (rattrapage max 2)
+# ENVOI PRÉDICTIONS CANAL (rattrapage max C1_CANAL_MAX_RATTRAPAGE)
 # ============================================================================
 
 async def send_canal_prediction(game_number: int, suit: str, triggered_by: str) -> dict:
@@ -251,50 +241,11 @@ async def update_canal_message(pred: dict, game_number: int, suit: str, trouve: 
                 logger.error(f"❌ Erreur update canal: {e}")
 
 # ============================================================================
-# VÉRIFICATION - Prédictions silencieuses (rattrapage max 1)
-# ============================================================================
-
-async def check_silent_result_c1(game_number: int, player_suits: List[str], is_finished: bool):
-    global c1_consec_losses, c1_pending_silent
-
-    to_delete = []
-
-    for pred_game, pred in list(c1_pending_silent.items()):
-        awaiting = pred.get('awaiting_rattrapage', 0)
-        target_game = pred_game + awaiting
-
-        if game_number != target_game:
-            continue
-
-        target_suit = pred['suit']
-
-        if target_suit in player_suits:
-            logger.info(f"🔕 SILENT #{pred_game} R{awaiting}: {target_suit} ✅ → consec_losses=0")
-            c1_consec_losses = 0
-            await update_silent_message(pred, pred_game, target_suit, True, awaiting)
-            update_silent_entry_status(pred_game, "gagné", awaiting)
-            to_delete.append(pred_game)
-
-        elif is_finished:
-            if awaiting < 1:
-                pred['awaiting_rattrapage'] = awaiting + 1
-                logger.info(f"🔕 SILENT #{pred_game}: {target_suit} ❌ → R1 (jeu #{pred_game + 1})")
-            else:
-                c1_consec_losses += 1
-                logger.info(f"🔕 SILENT #{pred_game}: ❌ PERDU → consec_losses={c1_consec_losses} → escalade canal")
-                await update_silent_message(pred, pred_game, target_suit, False, awaiting)
-                update_silent_entry_status(pred_game, "perdu", awaiting)
-                to_delete.append(pred_game)
-
-    for k in to_delete:
-        del c1_pending_silent[k]
-
-# ============================================================================
-# VÉRIFICATION - Prédictions canal (rattrapage max 2)
+# VÉRIFICATION - Prédictions canal (rattrapage max C1_CANAL_MAX_RATTRAPAGE)
 # ============================================================================
 
 async def check_canal_result_c1(game_number: int, player_suits: List[str], is_finished: bool):
-    global c1_consec_losses, c1_pending_canal
+    global c1_pending_canal
 
     to_delete = []
 
@@ -308,18 +259,17 @@ async def check_canal_result_c1(game_number: int, player_suits: List[str], is_fi
         target_suit = pred['suit']
 
         if target_suit in player_suits:
-            logger.info(f"📢 CANAL #{pred_game} R{awaiting}: {target_suit} ✅ → consec_losses=0")
-            c1_consec_losses = 0
+            logger.info(f"📢 CANAL #{pred_game} R{awaiting}: {target_suit} ✅")
             await update_canal_message(pred, pred_game, target_suit, True, awaiting)
             update_silent_entry_status(pred_game, "gagné", awaiting)
             to_delete.append(pred_game)
 
         elif is_finished:
-            if awaiting < 2:
+            if awaiting < C1_CANAL_MAX_RATTRAPAGE:
                 pred['awaiting_rattrapage'] = awaiting + 1
                 logger.info(f"📢 CANAL #{pred_game}: {target_suit} ❌ → R{awaiting+1} (jeu #{pred_game + awaiting + 1})")
             else:
-                logger.info(f"📢 CANAL #{pred_game}: ❌ PERDU final R2")
+                logger.info(f"📢 CANAL #{pred_game}: ❌ PERDU final R{C1_CANAL_MAX_RATTRAPAGE}")
                 await update_canal_message(pred, pred_game, target_suit, False, awaiting)
                 update_silent_entry_status(pred_game, "perdu", awaiting)
                 to_delete.append(pred_game)
@@ -333,29 +283,25 @@ async def check_canal_result_c1(game_number: int, player_suits: List[str], is_fi
 
 def get_c1_status_text() -> str:
     status = "✅ ON" if c1_active else "❌ OFF"
-    mode_canal = c1_consec_losses >= 1
+    if c1_inverse_case > 0:
+        mode_str = f"🔀 INVERSE {INVERSE_LABELS[c1_inverse_case]}"
+    else:
+        mode_str = "🎯 MANQUE (direct)"
     lines = [
-        f"📊 Compteur1: {status} | B={C1_B}",
-        f"🔕 Pertes silencieuses: {c1_consec_losses} → Mode: {'📢 CANAL (R2)' if mode_canal else '🔕 SILENT (R1)'}",
+        f"📊 Compteur1: {status} | B={c1_b} | Rattrapage max: R{C1_CANAL_MAX_RATTRAPAGE}",
+        f"Mode: {mode_str}",
         "",
         "Progression des absences (cartes joueur):",
     ]
     for suit in ALL_SUITS:
         count = c1_absences.get(suit, 0)
         filled = '█' * count
-        empty = '░' * max(0, C1_B - count)
+        empty = '░' * max(0, c1_b - count)
         bar = f"[{filled}{empty}]"
         display = SUIT_DISPLAY.get(suit, suit)
-        pred_display = SUIT_DISPLAY.get(C1_SUIT_MAP.get(suit, suit), suit)
-        lines.append(f"{display} → {pred_display} : {bar} {count}/{C1_B}")
-    if c1_pending_silent:
-        lines.append(f"\n🔕 Silencieux actifs: {len(c1_pending_silent)}")
-        for g, p in sorted(c1_pending_silent.items()):
-            sd = SUIT_DISPLAY.get(p['suit'], p['suit'])
-            ar = p.get('awaiting_rattrapage', 0)
-            lines.append(f"  • #{g} {sd} (R{ar})")
+        lines.append(f"{display} : {bar} {count}/{c1_b}")
     if c1_pending_canal:
-        lines.append(f"\n📢 Canal actifs: {len(c1_pending_canal)}")
+        lines.append(f"\n📢 Prédictions actives: {len(c1_pending_canal)}")
         for g, p in sorted(c1_pending_canal.items()):
             sd = SUIT_DISPLAY.get(p['suit'], p['suit'])
             ar = p.get('awaiting_rattrapage', 0)
@@ -363,8 +309,7 @@ def get_c1_status_text() -> str:
     return "\n".join(lines)
 
 async def process_compteur1(game_number: int, player_suits: List[str]):
-    global c1_absences, c1_processed_games
-    global c1_consec_losses, c1_pending_silent, c1_pending_canal
+    global c1_absences, c1_processed_games, c1_pending_canal, c1_inverse_case
 
     if not c1_active:
         return
@@ -385,47 +330,32 @@ async def process_compteur1(game_number: int, player_suits: List[str]):
             # Le costume est absent → on incrémente directement, sans vérification séquentielle
             c1_absences[suit] += 1
             count = c1_absences[suit]
-            logger.info(f"📊 C1 {suit}: absence {count}/{C1_B} (jeu #{game_number})")
+            logger.info(f"📊 C1 {suit}: absence {count}/{c1_b} (jeu #{game_number})")
 
-            if count >= C1_B:
-                pred_suit = C1_SUIT_MAP.get(suit, suit)
+            if count >= c1_b:
+                if c1_inverse_case > 0:
+                    pred_suit = INVERSE_MAPS[c1_inverse_case].get(suit, suit)
+                else:
+                    pred_suit = suit
                 pred_game = game_number + 1
                 c1_absences[suit] = 0
 
                 # Déjà une prédiction en attente pour ce jeu
-                if pred_game in c1_pending_silent or pred_game in c1_pending_canal:
+                if pred_game in c1_pending_canal:
                     continue
 
-                if c1_consec_losses >= 1:
-                    # Escalade vers le canal (rattrapage 2)
-                    losses_snap = c1_consec_losses
-                    c1_consec_losses = 0
-                    logger.info(
-                        f"📢 C1 CANAL: {suit} absent {C1_B}x, {losses_snap} perte(s) silencieuse(s) "
-                        f"→ #{pred_game} {pred_suit} [R max 2]"
-                    )
-                    add_silent_entry(pred_game, pred_suit, suit, losses_snap, mode="canal")
-                    msg_ids = await send_canal_prediction(pred_game, pred_suit, suit)
-                    c1_pending_canal[pred_game] = {
-                        'suit': pred_suit,
-                        'triggered_by': suit,
-                        'awaiting_rattrapage': 0,
-                        'msg_id': msg_ids['msg_id'],
-                    }
-                else:
-                    # Mode silencieux (rattrapage 1)
-                    logger.info(
-                        f"🔕 C1 SILENT: {suit} absent {C1_B}x "
-                        f"→ #{pred_game} {pred_suit} [R max 1]"
-                    )
-                    add_silent_entry(pred_game, pred_suit, suit, 0, mode="silent")
-                    msg_ids = await send_silent_prediction(pred_game, pred_suit, suit)
-                    c1_pending_silent[pred_game] = {
-                        'suit': pred_suit,
-                        'triggered_by': suit,
-                        'awaiting_rattrapage': 0,
-                        'msg_id': msg_ids['msg_id'],
-                    }
+                mode_label = f"INVERSE Cas {c1_inverse_case}" if c1_inverse_case > 0 else "MANQUE"
+                logger.info(
+                    f"📢 C1 [{mode_label}]: {suit} absent {c1_b}x → #{pred_game} {SUIT_DISPLAY.get(pred_suit, pred_suit)} [R max {C1_CANAL_MAX_RATTRAPAGE}]"
+                )
+                add_silent_entry(pred_game, pred_suit, suit, 0, mode="canal")
+                msg_ids = await send_canal_prediction(pred_game, pred_suit, suit)
+                c1_pending_canal[pred_game] = {
+                    'suit': pred_suit,
+                    'triggered_by': suit,
+                    'awaiting_rattrapage': 0,
+                    'msg_id': msg_ids['msg_id'],
+                }
 
 # ============================================================================
 # BOUCLE DE POLLING API
@@ -465,10 +395,7 @@ async def api_polling_loop():
                     current_game_number = game_number
                     p_display = " ".join(SUIT_DISPLAY.get(s, s) for s in player_suits) or "—"
 
-                    # Vérification des prédictions silencieuses (R max 1)
-                    await check_silent_result_c1(game_number, player_suits, is_finished)
-
-                    # Vérification des prédictions canal (R max 2)
+                    # Vérification des prédictions canal
                     await check_canal_result_c1(game_number, player_suits, is_finished)
 
                     # Traitement compteur C1
@@ -505,19 +432,15 @@ async def api_polling_loop():
 
 async def perform_full_reset(reason: str):
     global player_processed_games, api_results_cache, reset_done_for_cycle
-    global c1_absences, c1_processed_games
-    global c1_consec_losses, c1_pending_silent, c1_pending_canal
+    global c1_absences, c1_processed_games, c1_pending_canal
+    global silent_history
 
     player_processed_games = set()
     api_results_cache = {}
 
     c1_absences = {suit: 0 for suit in ALL_SUITS}
     c1_processed_games = set()
-    c1_consec_losses = 0
-    c1_pending_silent = {}
     c1_pending_canal = {}
-
-    global silent_history
     silent_history = []
 
     logger.info(f"🔄 {reason} - Reset effectué")
@@ -527,12 +450,11 @@ async def perform_full_reset(reason: str):
 # ============================================================================
 
 async def cmd_compteur1(event):
-    global c1_active, c1_absences, c1_processed_games
-    global c1_consec_losses, c1_pending_silent, c1_pending_canal
+    global c1_active, c1_b, c1_absences, c1_processed_games, c1_pending_canal
 
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -548,10 +470,8 @@ async def cmd_compteur1(event):
         c1_active = True
         c1_absences = {suit: 0 for suit in ALL_SUITS}
         c1_processed_games = set()
-        c1_consec_losses = 0
-        c1_pending_silent = {}
         c1_pending_canal = {}
-        await event.respond(f"✅ Compteur1 ACTIVÉ | B={C1_B}\n\n" + get_c1_status_text())
+        await event.respond(f"✅ Compteur1 ACTIVÉ | B={c1_b}\n\n" + get_c1_status_text())
 
     elif arg == 'off':
         c1_active = False
@@ -560,27 +480,41 @@ async def cmd_compteur1(event):
     elif arg == 'reset':
         c1_absences = {suit: 0 for suit in ALL_SUITS}
         c1_processed_games = set()
-        c1_consec_losses = 0
-        c1_pending_silent = {}
         c1_pending_canal = {}
         await event.respond("🔄 Compteur1 remis à zéro\n\n" + get_c1_status_text())
+
+    elif arg == 'b':
+        if len(parts) < 3:
+            await event.respond(f"📊 Valeur actuelle de B : {c1_b}\nUsage : `/compteur1 b <nombre>`")
+            return
+        try:
+            new_b = int(parts[2])
+            if new_b < 1:
+                raise ValueError
+            c1_b = new_b
+            c1_absences = {suit: 0 for suit in ALL_SUITS}
+            c1_pending_canal = {}
+            await event.respond(f"✅ B mis à jour → B={c1_b}\nCompteurs et prédictions remis à zéro.\n\n" + get_c1_status_text())
+        except ValueError:
+            await event.respond("❌ Valeur invalide. Exemple : `/compteur1 b 4`")
 
     else:
         await event.respond(
             "📊 **COMPTEUR1 - Aide**\n\n"
-            f"B={C1_B} | Silencieux R1 → Canal R2 après 1 perte\n\n"
-            "Mapping: ♣️→♦️ | ♦️→♣️ | ♠️→❤️ | ❤️→♠️\n\n"
+            f"B={c1_b} | Rattrapage canal : R{C1_CANAL_MAX_RATTRAPAGE}\n"
+            "Prédiction = costume manquant lui-même\n\n"
             "`/compteur1` — Afficher l'état\n"
             "`/compteur1 on` — Activer\n"
             "`/compteur1 off` — Désactiver\n"
-            "`/compteur1 reset` — Remettre à zéro"
+            "`/compteur1 reset` — Remettre à zéro\n"
+            "`/compteur1 b <n>` — Changer la valeur de B"
         )
 
 
 async def cmd_silencieux(event):
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -594,29 +528,21 @@ async def cmd_silencieux(event):
         ""
     ]
 
-    actives_silent = [(g, p) for g, p in sorted(c1_pending_silent.items())]
     actives_canal = [(g, p) for g, p in sorted(c1_pending_canal.items())]
 
-    if actives_silent or actives_canal:
+    if actives_canal:
         lines.append("**⏳ EN COURS :**")
-        for g, p in actives_silent:
-            sd = SUIT_DISPLAY.get(p['suit'], p['suit'])
-            td = SUIT_DISPLAY.get(p['triggered_by'], p['triggered_by'])
-            ar = p.get('awaiting_rattrapage', 0)
-            lines.append(
-                f"  🔕 Game #N{g} R{ar} | {td} → {sd} | [SILENT R max 1]"
-            )
         for g, p in actives_canal:
             sd = SUIT_DISPLAY.get(p['suit'], p['suit'])
             td = SUIT_DISPLAY.get(p['triggered_by'], p['triggered_by'])
             ar = p.get('awaiting_rattrapage', 0)
             lines.append(
-                f"  📢 Game #N{g} R{ar} | {td} → {sd} | [CANAL R max 2]"
+                f"  📢 Game #{g} R{ar} | {td} absent → {sd} | [R max {C1_CANAL_MAX_RATTRAPAGE}]"
             )
         lines.append("")
 
     if not silent_history:
-        if not actives_silent and not actives_canal:
+        if not actives_canal:
             lines.append("Aucune prédiction enregistrée.")
     else:
         lines.append(f"**📜 HISTORIQUE** (dernières {min(len(silent_history), max_show)}) :")
@@ -650,10 +576,9 @@ async def cmd_silencieux(event):
         lines.append(f"_... {len(silent_history) - max_show} entrées. Tapez `/silencieux all` pour tout voir._")
 
     lines.append("═══════════════════════════════════════")
-    mode_actuel = "📢 CANAL (R max 2)" if c1_consec_losses >= 1 else "🔕 SILENT (R max 1)"
     lines.append(
-        f"\n📊 **Résumé C1:**\n"
-        f"Pertes silencieuses: **{c1_consec_losses}** → Mode actuel: {mode_actuel}"
+        f"\n📊 **Résumé C1:** B={c1_b} | R max {C1_CANAL_MAX_RATTRAPAGE} | "
+        f"Actives: {len(c1_pending_canal)}"
     )
 
     full_text = "\n".join(lines)
@@ -668,7 +593,7 @@ async def cmd_silencieux(event):
 async def cmd_status(event):
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -723,7 +648,7 @@ async def check_channel_access(channel_id) -> dict:
 async def cmd_channels(event):
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -764,7 +689,7 @@ async def cmd_channels(event):
 async def cmd_test(event):
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -795,7 +720,7 @@ async def cmd_test(event):
 async def cmd_reset(event):
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -807,7 +732,7 @@ async def cmd_reset(event):
 async def cmd_announce(event):
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -848,7 +773,7 @@ async def cmd_predi(event):
 
     if event.is_group or event.is_channel:
         return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.sender_id not in ADMIN_IDS:
         await event.respond("🔒 Admin uniquement")
         return
 
@@ -942,6 +867,10 @@ async def cmd_help(event):
         "`/compteur1` — État du Compteur1\n"
         "`/compteur1 on/off` — Activer/désactiver\n"
         "`/compteur1 reset` — Remettre à zéro\n"
+        "`/compteur1 b <n>` — Changer la valeur de B\n"
+        "`/inverse` — Voir le mode inverse\n"
+        "`/inverse 1/2/3` — Activer un cas inverse\n"
+        "`/inverse off` — Désactiver (prédit le manque)\n"
         "`/silencieux` — Historique des prédictions\n"
         "`/silencieux all` — Tout l'historique\n"
         "`/status` — État complet\n"
@@ -954,11 +883,69 @@ async def cmd_help(event):
     )
 
 # ============================================================================
+# COMMANDE /inverse
+# ============================================================================
+
+async def cmd_inverse(event):
+    global c1_inverse_case, c1_absences, c1_pending_canal
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id not in ADMIN_IDS:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    parts = event.message.message.strip().split()
+
+    if len(parts) == 1:
+        if c1_inverse_case == 0:
+            status = "❌ Désactivé — Mode MANQUE (direct)"
+        else:
+            status = f"✅ Activé — {INVERSE_LABELS[c1_inverse_case]}"
+        await event.respond(
+            f"🔀 **MODE INVERSE**\n\n"
+            f"État: {status}\n\n"
+            "**Choisir un cas :**\n"
+            "`/inverse 1` — ♠️↔♣️ | ❤️↔♦️\n"
+            "`/inverse 2` — ❤️↔♣️ | ♦️↔♠️\n"
+            "`/inverse 3` — ♦️↔♣️ | ♠️↔❤️\n"
+            "`/inverse off` — Désactiver (prédit le manque)"
+        )
+        return
+
+    arg = parts[1].lower()
+
+    if arg == 'off' or arg == '0':
+        c1_inverse_case = 0
+        c1_absences = {suit: 0 for suit in ALL_SUITS}
+        c1_pending_canal = {}
+        await event.respond(
+            "✅ Mode inverse **DÉSACTIVÉ**\n"
+            "→ Le bot prédit désormais le costume **manquant**.\n\n"
+            + get_c1_status_text()
+        )
+
+    elif arg in ('1', '2', '3'):
+        c1_inverse_case = int(arg)
+        c1_absences = {suit: 0 for suit in ALL_SUITS}
+        c1_pending_canal = {}
+        await event.respond(
+            f"✅ Mode inverse **ACTIVÉ** — {INVERSE_LABELS[c1_inverse_case]}\n"
+            f"→ Quand un costume atteint B={c1_b} absences, son inverse est prédit.\n\n"
+            + get_c1_status_text()
+        )
+
+    else:
+        await event.respond("❌ Usage: `/inverse 1`, `/inverse 2`, `/inverse 3`, `/inverse off`")
+
+
+# ============================================================================
 # CONFIGURATION DES HANDLERS
 # ============================================================================
 
 def setup_handlers():
     client.add_event_handler(cmd_compteur1, events.NewMessage(pattern=r'^/compteur1'))
+    client.add_event_handler(cmd_inverse, events.NewMessage(pattern=r'^/inverse'))
     client.add_event_handler(cmd_silencieux, events.NewMessage(pattern=r'^/silencieux'))
     client.add_event_handler(cmd_predi, events.NewMessage(pattern=r'^/predi'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))

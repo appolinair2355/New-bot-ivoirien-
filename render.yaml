@@ -9,6 +9,14 @@ services:
         value: "10000"
       - key: API_POLL_INTERVAL
         value: "5"
+      - key: C1_B
+        value: "3"
+      - key: C1_SILENT_MAX_RATTRAPAGE
+        value: "1"
+      - key: C1_CANAL_MAX_RATTRAPAGE
+        value: "2"
+      - key: MAX_SILENT_HISTORY
+        value: "150"
       - key: API_ID
         sync: false
       - key: API_HASH
@@ -18,8 +26,6 @@ services:
       - key: ADMIN_ID
         sync: false
       - key: TELEGRAM_SESSION
-        sync: false
-      - key: C1_SILENT_CHANNEL_ID
         sync: false
       - key: PREDICTION_CHANNEL_ID
         sync: false
