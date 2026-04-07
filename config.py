@@ -19,7 +19,7 @@ PORT = int(os.getenv("PORT", "10000"))
 API_POLL_INTERVAL = int(os.getenv("API_POLL_INTERVAL", "5"))
 
 # Canal silencieux C1
-C1_SILENT_CHANNEL_ID = parse_channel_id(os.getenv("C1_SILENT_CHANNEL_ID", "-1003651435888"))
+C1_SILENT_CHANNEL_ID = parse_channel_id(os.getenv("C1_SILENT_CHANNEL_ID", "-1003651435"))
 
 # Canal principal (escalade après 1 perte silencieuse)
 PREDICTION_CHANNEL_ID = parse_channel_id(os.getenv("PREDICTION_CHANNEL_ID", "-1003336559159"))
