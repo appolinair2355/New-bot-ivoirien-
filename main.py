@@ -60,7 +60,6 @@ C1_SUIT_MAP = {'♣': '♦', '♦': '♣', '♠': '♥', '♥': '♠'}
 
 c1_active: bool = True
 c1_absences: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
-c1_last_seen: Dict[str, int] = {suit: 0 for suit in ALL_SUITS}
 c1_processed_games: set = set()
 c1_consec_losses: int = 0        # pertes silencieuses consécutives
 c1_pending_silent: Dict[int, dict] = {}   # prédictions silencieuses en attente
@@ -364,7 +363,7 @@ def get_c1_status_text() -> str:
     return "\n".join(lines)
 
 async def process_compteur1(game_number: int, player_suits: List[str]):
-    global c1_absences, c1_last_seen, c1_processed_games
+    global c1_absences, c1_processed_games
     global c1_consec_losses, c1_pending_silent, c1_pending_canal
 
     if not c1_active:
@@ -378,17 +377,13 @@ async def process_compteur1(game_number: int, player_suits: List[str]):
 
     for suit in ALL_SUITS:
         if suit in player_suits:
+            # Le costume est présent → on remet son compteur à zéro
             if c1_absences[suit] > 0:
                 logger.info(f"📊 C1 {suit}: trouvé #{game_number} → reset (était {c1_absences[suit]})")
             c1_absences[suit] = 0
-            c1_last_seen[suit] = game_number
         else:
-            last_seen = c1_last_seen.get(suit, 0)
-            if last_seen == 0 or game_number == last_seen + 1:
-                c1_absences[suit] += 1
-            else:
-                c1_absences[suit] = 1
-            c1_last_seen[suit] = game_number
+            # Le costume est absent → on incrémente directement, sans vérification séquentielle
+            c1_absences[suit] += 1
             count = c1_absences[suit]
             logger.info(f"📊 C1 {suit}: absence {count}/{C1_B} (jeu #{game_number})")
 
@@ -510,14 +505,13 @@ async def api_polling_loop():
 
 async def perform_full_reset(reason: str):
     global player_processed_games, api_results_cache, reset_done_for_cycle
-    global c1_absences, c1_last_seen, c1_processed_games
+    global c1_absences, c1_processed_games
     global c1_consec_losses, c1_pending_silent, c1_pending_canal
 
     player_processed_games = set()
     api_results_cache = {}
 
     c1_absences = {suit: 0 for suit in ALL_SUITS}
-    c1_last_seen = {suit: 0 for suit in ALL_SUITS}
     c1_processed_games = set()
     c1_consec_losses = 0
     c1_pending_silent = {}
@@ -533,7 +527,7 @@ async def perform_full_reset(reason: str):
 # ============================================================================
 
 async def cmd_compteur1(event):
-    global c1_active, c1_absences, c1_last_seen, c1_processed_games
+    global c1_active, c1_absences, c1_processed_games
     global c1_consec_losses, c1_pending_silent, c1_pending_canal
 
     if event.is_group or event.is_channel:
@@ -553,7 +547,6 @@ async def cmd_compteur1(event):
     if arg == 'on':
         c1_active = True
         c1_absences = {suit: 0 for suit in ALL_SUITS}
-        c1_last_seen = {suit: 0 for suit in ALL_SUITS}
         c1_processed_games = set()
         c1_consec_losses = 0
         c1_pending_silent = {}
@@ -566,7 +559,6 @@ async def cmd_compteur1(event):
 
     elif arg == 'reset':
         c1_absences = {suit: 0 for suit in ALL_SUITS}
-        c1_last_seen = {suit: 0 for suit in ALL_SUITS}
         c1_processed_games = set()
         c1_consec_losses = 0
         c1_pending_silent = {}
